@@ -414,6 +414,27 @@ func (s *ChannelStore) UpdateLarkOutboundCardStatus(ctx context.Context, arg Upd
 	})
 }
 
+// SetLarkOutboundCardIdentity records the cardkit card entity id and the
+// delivered card message id on a claimed outbound card row, flipping it to
+// "streaming" so terminal events can find the card even after a restart.
+func (s *ChannelStore) SetLarkOutboundCardIdentity(ctx context.Context, arg SetOutboundCardIdentityParams) error {
+	return s.Queries.SetChannelOutboundCardIdentity(ctx, db.SetChannelOutboundCardIdentityParams{
+		ID:                   arg.ID,
+		ChannelCardMessageID: arg.ChannelCardMessageID,
+		CardEntityID:         arg.CardEntityID,
+	})
+}
+
+// UpdateLarkOutboundCardProgress persists the latest accepted cardkit
+// operation sequence and the row status.
+func (s *ChannelStore) UpdateLarkOutboundCardProgress(ctx context.Context, arg UpdateOutboundCardProgressParams) error {
+	return s.Queries.UpdateChannelOutboundCardProgress(ctx, db.UpdateChannelOutboundCardProgressParams{
+		ID:           arg.ID,
+		LastSequence: arg.LastSequence,
+		Status:       arg.Status,
+	})
+}
+
 // installationsFromRows maps a slice of channel_installation rows to domain
 // Installations, surfacing the first config-decode error.
 func installationsFromRows(rows []db.ChannelInstallation) ([]Installation, error) {

@@ -908,7 +908,7 @@ INSERT INTO channel_outbound_card_message (
 ) VALUES (
     $1, $6, $2, $3, $4, $5
 )
-RETURNING id, chat_session_id, task_id, channel_type, channel_chat_id, channel_card_message_id, status, last_patched_at, created_at
+RETURNING id, chat_session_id, task_id, channel_type, channel_chat_id, channel_card_message_id, status, last_patched_at, created_at, card_entity_id, last_sequence
 `
 
 type CreateChannelOutboundCardMessageParams struct {
@@ -943,6 +943,8 @@ func (q *Queries) CreateChannelOutboundCardMessage(ctx context.Context, arg Crea
 		&i.Status,
 		&i.LastPatchedAt,
 		&i.CreatedAt,
+		&i.CardEntityID,
+		&i.LastSequence,
 	)
 	return i, err
 }
@@ -1895,7 +1897,7 @@ func (q *Queries) GetChannelInstallationSlotOwnerByAppID(ctx context.Context, ar
 }
 
 const getChannelOutboundCardByTask = `-- name: GetChannelOutboundCardByTask :one
-SELECT id, chat_session_id, task_id, channel_type, channel_chat_id, channel_card_message_id, status, last_patched_at, created_at FROM channel_outbound_card_message
+SELECT id, chat_session_id, task_id, channel_type, channel_chat_id, channel_card_message_id, status, last_patched_at, created_at, card_entity_id, last_sequence FROM channel_outbound_card_message
 WHERE task_id = $1
   AND channel_type = $2
 `
@@ -1921,6 +1923,8 @@ func (q *Queries) GetChannelOutboundCardByTask(ctx context.Context, arg GetChann
 		&i.Status,
 		&i.LastPatchedAt,
 		&i.CreatedAt,
+		&i.CardEntityID,
+		&i.LastSequence,
 	)
 	return i, err
 }
@@ -3328,6 +3332,29 @@ func (q *Queries) SetChannelInstallationStatus(ctx context.Context, arg SetChann
 	return err
 }
 
+const setChannelOutboundCardIdentity = `-- name: SetChannelOutboundCardIdentity :exec
+UPDATE channel_outbound_card_message
+SET channel_card_message_id = $2,
+    card_entity_id = $3,
+    status = 'streaming',
+    last_patched_at = now()
+WHERE id = $1
+`
+
+type SetChannelOutboundCardIdentityParams struct {
+	ID                   pgtype.UUID `json:"id"`
+	ChannelCardMessageID string      `json:"channel_card_message_id"`
+	CardEntityID         string      `json:"card_entity_id"`
+}
+
+// Claims a card row for the streaming flow once the cardkit card entity
+// exists and has been delivered: records both ids and flips the row to
+// 'streaming' so finalization paths can find the card after a restart.
+func (q *Queries) SetChannelOutboundCardIdentity(ctx context.Context, arg SetChannelOutboundCardIdentityParams) error {
+	_, err := q.db.Exec(ctx, setChannelOutboundCardIdentity, arg.ID, arg.ChannelCardMessageID, arg.CardEntityID)
+	return err
+}
+
 const settleChannelReplyDelivery = `-- name: SettleChannelReplyDelivery :execrows
 UPDATE channel_reply_delivery
 SET phase = 'settled', settled_reason = $3, owner_token = NULL, owner_expires_at = NULL, updated_at = now()
@@ -3449,6 +3476,28 @@ type UpdateChannelChatSessionBindingReplyTargetParams struct {
 // after a later generation has already moved it.
 func (q *Queries) UpdateChannelChatSessionBindingReplyTarget(ctx context.Context, arg UpdateChannelChatSessionBindingReplyTargetParams) error {
 	_, err := q.db.Exec(ctx, updateChannelChatSessionBindingReplyTarget, arg.LastMessageID, arg.LastThreadID, arg.ReplyChatSessionID)
+	return err
+}
+
+const updateChannelOutboundCardProgress = `-- name: UpdateChannelOutboundCardProgress :exec
+UPDATE channel_outbound_card_message
+SET last_sequence = $2,
+    status = $3,
+    last_patched_at = now()
+WHERE id = $1
+`
+
+type UpdateChannelOutboundCardProgressParams struct {
+	ID           pgtype.UUID `json:"id"`
+	LastSequence int32       `json:"last_sequence"`
+	Status       string      `json:"status"`
+}
+
+// Persists the latest accepted cardkit operation sequence alongside the
+// status, so a recovery path that never saw the in-memory counter can
+// continue the sequence strictly increasing.
+func (q *Queries) UpdateChannelOutboundCardProgress(ctx context.Context, arg UpdateChannelOutboundCardProgressParams) error {
+	_, err := q.db.Exec(ctx, updateChannelOutboundCardProgress, arg.ID, arg.LastSequence, arg.Status)
 	return err
 }
 

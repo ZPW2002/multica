@@ -148,7 +148,7 @@ type TokenCacheInvalidator interface {
 // ReactionLister is implemented by an APIClient that can list the reactions
 // already sitting on a message (GET /im/v1/messages/{message_id}/reactions).
 // The typing-indicator sweep uses it to find and delete the bot's own Typing
-// reactions without consulting any in-process state, which is what keeps the
+// reactions without consulting in-process state, which is what keeps the
 // badge removable after a restart or on another replica.
 //
 // It is deliberately separate from APIClient rather than a method on it,
@@ -157,6 +157,83 @@ type TokenCacheInvalidator interface {
 // list plumbing. Callers type-assert and skip the sweep when it is absent.
 type ReactionLister interface {
 	ListMessageReactions(ctx context.Context, p ListMessageReactionsParams) ([]MessageReaction, error)
+}
+
+// CardStreamingClient is the cardkit v1 surface streaming replies run on:
+// create a card entity in streaming mode, deliver it as an IM message,
+// typewriter-update one markdown element with full accumulated content, and
+// flip the card's streaming mode when the reply settles. Feishu's streaming
+// contract, per the cardkit docs:
+//
+//   - The card entity is created once (schema 2.0, streaming_mode on) and
+//     can be sent as a message exactly once; updates then address the
+//     card_id + element_id, never a fresh send.
+//   - Content updates carry the FULL text: when the old content is a prefix
+//     of the new one, Feishu's client renders only the delta with a
+//     typewriter effect.
+//   - Every content/settings operation carries a `sequence` that must
+//     strictly increase relative to the previous operation on the card.
+//
+// Like ReactionLister it is deliberately separate from APIClient: only the
+// real HTTP client implements it — the stub client does not — and the
+// streaming replier type-asserts and disables itself when the interface is
+// absent.
+type CardStreamingClient interface {
+	// CreateCardEntity creates a cardkit card entity from a schema-2.0 card
+	// JSON document and returns its card_id. The entity is NOT delivered to
+	// any chat by this call.
+	CreateCardEntity(ctx context.Context, p CreateCardEntityParams) (string, error)
+
+	// SendCardMessage delivers an existing card entity into a chat as an
+	// interactive message and returns Lark's message_id. ReplyTarget threads
+	// the card into the originating topic / native reply, same as the text
+	// send paths.
+	SendCardMessage(ctx context.Context, p SendCardMessageParams) (string, error)
+
+	// UpdateCardElementContent replaces the full content of one card
+	// element. Sequence must strictly increase per card operation.
+	UpdateCardElementContent(ctx context.Context, p UpdateCardElementContentParams) error
+
+	// SetCardStreamingMode toggles the card entity's streaming_mode config
+	// (false settles the card — the typewriter stops and the card becomes a
+	// normal message). Sequence must strictly increase per card operation.
+	SetCardStreamingMode(ctx context.Context, p SetCardStreamingModeParams) error
+}
+
+// CreateCardEntityParams is the input shape for creating a cardkit card
+// entity. CardJSON is the full schema-2.0 card document; the streaming
+// replier builds it with streaming_mode on and one markdown element whose
+// element_id later addresses the typewriter updates.
+type CreateCardEntityParams struct {
+	InstallationID InstallationCredentials
+	CardJSON       string
+}
+
+// SendCardMessageParams delivers a card entity into a chat.
+type SendCardMessageParams struct {
+	InstallationID InstallationCredentials
+	ChatID         ChatID
+	CardID         string
+	ReplyTarget    ReplyTarget
+}
+
+// UpdateCardElementContentParams carries a full-content element update.
+// Content is the ENTIRE accumulated text (prefix-extension gives the
+// typewriter effect), not just the delta.
+type UpdateCardElementContentParams struct {
+	InstallationID InstallationCredentials
+	CardID         string
+	ElementID      string
+	Content        string
+	Sequence       int32
+}
+
+// SetCardStreamingModeParams toggles streaming_mode on a card entity.
+type SetCardStreamingModeParams struct {
+	InstallationID InstallationCredentials
+	CardID         string
+	StreamingMode  bool
+	Sequence       int32
 }
 
 // ListMessagesParams selects a bounded, recent window of messages in a

@@ -37,6 +37,10 @@ Only after binding can Multica confirm which workspace member a message comes fr
 
 ## Hand work to the agent in Feishu
 
+### Streaming replies
+
+Agent replies stream into a card as they are generated: the answer appears while the agent works, updates live, and settles into its final rendered form when the run completes. While the agent reasons, its thinking streams at the top of the card (the preview freezes in place with a note once it grows very long); when the run completes, the card settles on the full answer alone and the thinking drops away — the complete reasoning stays in the task's message history in Multica. Failed runs keep the partial output with a failure note.
+
 ### Direct messages
 
 Message the Bot directly. Consecutive messages stay in the same Multica conversation, and the agent's replies go back to that conversation.

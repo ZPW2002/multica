@@ -122,9 +122,19 @@ type OutboundCardMessage struct {
 	TaskID               pgtype.UUID
 	ChannelChatID        string
 	ChannelCardMessageID string
-	Status               string
-	LastPatchedAt        pgtype.Timestamptz
-	CreatedAt            pgtype.Timestamptz
+	// CardEntityID is the cardkit card entity a streaming reply updates
+	// (POST /cardkit/v1/cards). Distinct from ChannelCardMessageID, which is
+	// the delivered message carrying the card; cardkit content/settings
+	// calls address the entity, not the message.
+	CardEntityID string
+	Status       string
+	// LastSequence is the last cardkit operation sequence the server
+	// accepted. Recovery paths that lose the in-memory counter resume from
+	// here because cardkit requires every operation's sequence to strictly
+	// increase relative to the previous one.
+	LastSequence  int32
+	LastPatchedAt pgtype.Timestamptz
+	CreatedAt     pgtype.Timestamptz
 }
 
 // feishuInstallConfig is the JSON shape of channel_installation.config for the
@@ -272,7 +282,9 @@ func outboundCardFromRow(row db.ChannelOutboundCardMessage) OutboundCardMessage 
 		TaskID:               row.TaskID,
 		ChannelChatID:        row.ChannelChatID,
 		ChannelCardMessageID: row.ChannelCardMessageID,
+		CardEntityID:         row.CardEntityID,
 		Status:               row.Status,
+		LastSequence:         row.LastSequence,
 		LastPatchedAt:        row.LastPatchedAt,
 		CreatedAt:            row.CreatedAt,
 	}

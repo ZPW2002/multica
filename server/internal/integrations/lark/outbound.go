@@ -325,6 +325,18 @@ func (p *Patcher) processEvent(ctx context.Context, e events.Event) error {
 		return nil
 	}
 
+	// A claimed outbound card row means the StreamingReplier owns this
+	// task's reply: the answer is already flowing into a Feishu streaming
+	// card and its terminal event settles the card. Sending the assembled
+	// reply here as well would duplicate the answer in the chat.
+	if e.Type == protocol.EventChatDone || e.Type == protocol.EventTaskFailed {
+		if _, err := p.queries.GetLarkOutboundCardByTask(ctx, taskID); err == nil {
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lookup streaming card for task: %w", err)
+		}
+	}
+
 	inst, err := p.queries.GetLarkInstallation(ctx, binding.InstallationID)
 	if err != nil {
 		return fmt.Errorf("load installation: %w", err)

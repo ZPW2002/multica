@@ -1176,6 +1176,27 @@ SET status = $2,
     last_patched_at = now()
 WHERE id = $1;
 
+-- name: SetChannelOutboundCardIdentity :exec
+-- Claims a card row for the streaming flow once the cardkit card entity
+-- exists and has been delivered: records both ids and flips the row to
+-- 'streaming' so finalization paths can find the card after a restart.
+UPDATE channel_outbound_card_message
+SET channel_card_message_id = $2,
+    card_entity_id = $3,
+    status = 'streaming',
+    last_patched_at = now()
+WHERE id = $1;
+
+-- name: UpdateChannelOutboundCardProgress :exec
+-- Persists the latest accepted cardkit operation sequence alongside the
+-- status, so a recovery path that never saw the in-memory counter can
+-- continue the sequence strictly increasing.
+UPDATE channel_outbound_card_message
+SET last_sequence = $2,
+    status = $3,
+    last_patched_at = now()
+WHERE id = $1;
+
 -- name: DeleteChannelOutboundCardMessagesBySession :exec
 -- Application-layer integrity (channel_* has no FK/cascade, MUL-3515 §4): drop the
 -- outbound card-message rows for a chat_session being deleted. They are keyed by

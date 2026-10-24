@@ -135,3 +135,20 @@ type UpdateOutboundCardStatusParams struct {
 	ID     pgtype.UUID
 	Status string
 }
+
+// SetOutboundCardIdentityParams records the cardkit card entity id and the
+// delivered card message id once a streaming card exists (status becomes
+// "streaming").
+type SetOutboundCardIdentityParams struct {
+	ID                   pgtype.UUID
+	ChannelCardMessageID string
+	CardEntityID         string
+}
+
+// UpdateOutboundCardProgressParams persists the last cardkit operation
+// sequence the server accepted, with the row status.
+type UpdateOutboundCardProgressParams struct {
+	ID           pgtype.UUID
+	LastSequence int32
+	Status       string
+}

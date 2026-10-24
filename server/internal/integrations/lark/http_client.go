@@ -502,6 +502,167 @@ func (c *httpAPIClient) PatchInteractiveCard(ctx context.Context, p PatchCardPar
 	return nil
 }
 
+// Cardkit streaming error codes the streaming replier reacts to beyond
+// generic failure. Both mean the card's streaming_mode is currently off
+// server-side — 200850 is Feishu auto-closing it after an inactivity
+// timeout, 300309 is a content update reaching an already-closed card. The
+// remedy in both cases is the documented one: PATCH settings with
+// streaming_mode=true (consuming a sequence) and retry the update.
+const (
+	codeCardStreamingTimeout = 200850
+	codeCardStreamingClosed  = 300309
+)
+
+// CreateCardEntity implements CardStreamingClient: POST /cardkit/v1/cards
+// with type=card_json. The card document travels as a STRING inside the
+// request body (Lark double-encodes it), which json.Marshal of the outer
+// map handles here.
+func (c *httpAPIClient) CreateCardEntity(ctx context.Context, p CreateCardEntityParams) (string, error) {
+	if p.CardJSON == "" {
+		return "", errors.New("lark http client: missing card json")
+	}
+	body := map[string]string{
+		"type": "card_json",
+		"data": p.CardJSON,
+	}
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			CardID string `json:"card_id"`
+		} `json:"data"`
+	}
+	if err := c.doAuthedJSON(ctx, p.InstallationID, http.MethodPost, "/open-apis/cardkit/v1/cards", body, &resp); err != nil {
+		return "", fmt.Errorf("lark http client: create card entity: %w", err)
+	}
+	if resp.Code != 0 || resp.Data.CardID == "" {
+		if isTokenError(resp.Code) {
+			c.invalidateToken(p.InstallationID.AppID)
+		}
+		return "", &APIError{Op: "create card entity", Code: resp.Code, Msg: resp.Msg}
+	}
+	return resp.Data.CardID, nil
+}
+
+// SendCardMessage implements CardStreamingClient: delivers an existing card
+// entity into a chat as msg_type=interactive with a {"type":"card",
+// "data":{"card_id":...}} content ref. The reply / chat-level routing is the
+// same outboundMessageRequest split every other send uses, so a streamed
+// card lands in the same topic / native-reply position a plain reply would.
+func (c *httpAPIClient) SendCardMessage(ctx context.Context, p SendCardMessageParams) (string, error) {
+	if p.ChatID == "" {
+		return "", errors.New("lark http client: missing chat_id")
+	}
+	if p.CardID == "" {
+		return "", errors.New("lark http client: missing card id")
+	}
+	contentBytes, err := json.Marshal(map[string]any{
+		"type": "card",
+		"data": map[string]string{"card_id": p.CardID},
+	})
+	if err != nil {
+		return "", fmt.Errorf("lark http client: encode card ref: %w", err)
+	}
+	path, body := outboundMessageRequest(p.ChatID, "interactive", string(contentBytes), p.ReplyTarget)
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	if err := c.doAuthedJSON(ctx, p.InstallationID, http.MethodPost, path, body, &resp); err != nil {
+		return "", fmt.Errorf("lark http client: send card message: %w", err)
+	}
+	if resp.Code != 0 || resp.Data.MessageID == "" {
+		if isTokenError(resp.Code) {
+			c.invalidateToken(p.InstallationID.AppID)
+		}
+		return "", &APIError{Op: "send card message", Code: resp.Code, Msg: resp.Msg}
+	}
+	return resp.Data.MessageID, nil
+}
+
+// UpdateCardElementContent implements CardStreamingClient:
+// PUT /cardkit/v1/cards/{card_id}/elements/{element_id}/content. Content is
+// the FULL accumulated text — Feishu renders the suffix beyond the current
+// content with the typewriter effect as long as the old content is a prefix
+// of the new one. Sequence must strictly increase across every operation on
+// the card.
+func (c *httpAPIClient) UpdateCardElementContent(ctx context.Context, p UpdateCardElementContentParams) error {
+	if p.CardID == "" {
+		return errors.New("lark http client: missing card id")
+	}
+	if p.ElementID == "" {
+		return errors.New("lark http client: missing element id")
+	}
+	if p.Content == "" {
+		return errors.New("lark http client: missing content")
+	}
+	if p.Sequence < 1 {
+		return errors.New("lark http client: sequence must be a positive int32")
+	}
+	body := map[string]any{
+		"content":  p.Content,
+		"sequence": p.Sequence,
+	}
+	path := "/open-apis/cardkit/v1/cards/" + url.PathEscape(p.CardID) +
+		"/elements/" + url.PathEscape(p.ElementID) + "/content"
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := c.doAuthedJSON(ctx, p.InstallationID, http.MethodPut, path, body, &resp); err != nil {
+		return fmt.Errorf("lark http client: update card element content: %w", err)
+	}
+	if resp.Code != 0 {
+		if isTokenError(resp.Code) {
+			c.invalidateToken(p.InstallationID.AppID)
+		}
+		return &APIError{Op: "update card element content", Code: resp.Code, Msg: resp.Msg}
+	}
+	return nil
+}
+
+// SetCardStreamingMode implements CardStreamingClient:
+// PATCH /cardkit/v1/cards/{card_id}/settings. The settings document also
+// travels string-encoded inside the body. Setting streaming_mode=false
+// settles a card: the typewriter state resolves and the card stops
+// accepting streaming updates.
+func (c *httpAPIClient) SetCardStreamingMode(ctx context.Context, p SetCardStreamingModeParams) error {
+	if p.CardID == "" {
+		return errors.New("lark http client: missing card id")
+	}
+	if p.Sequence < 1 {
+		return errors.New("lark http client: sequence must be a positive int32")
+	}
+	settingsBytes, err := json.Marshal(map[string]any{
+		"config": map[string]any{"streaming_mode": p.StreamingMode},
+	})
+	if err != nil {
+		return fmt.Errorf("lark http client: encode card settings: %w", err)
+	}
+	body := map[string]any{
+		"settings": string(settingsBytes),
+		"sequence": p.Sequence,
+	}
+	path := "/open-apis/cardkit/v1/cards/" + url.PathEscape(p.CardID) + "/settings"
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := c.doAuthedJSON(ctx, p.InstallationID, http.MethodPatch, path, body, &resp); err != nil {
+		return fmt.Errorf("lark http client: set card streaming mode: %w", err)
+	}
+	if resp.Code != 0 {
+		if isTokenError(resp.Code) {
+			c.invalidateToken(p.InstallationID.AppID)
+		}
+		return &APIError{Op: "set card streaming mode", Code: resp.Code, Msg: resp.Msg}
+	}
+	return nil
+}
+
 // SendBindingPromptCard renders the member-binding card and posts it
 // directly to the unbound user's open_id (not the chat). Keeping the
 // card template inside this client — rather than the dispatcher —

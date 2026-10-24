@@ -627,6 +627,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				patcher.SetTypingIndicatorManager(typingIndicator)
 				h.LarkTyping = typingIndicator
 
+				// Streaming replies: while a Feishu-bound chat task runs, its
+				// text output is mirrored into a Feishu streaming card
+				// (cardkit) instead of arriving as one message at chat:done.
+				// The claimed channel_outbound_card_message row is what tells
+				// the Patcher above to stand down for that task. No-op when
+				// the client cannot stream cards (stub deployments).
+				streamer := lark.NewStreamingReplier(cs, installSvc, larkClient, lark.StreamingConfig{})
+				streamer.Register(bus)
+
 				// Inbound pipeline seams: lark_inbound_audit logger and the
 				// shared channel-agnostic chat-session service. They back the
 				// Feishu ResolverSet that the engine.Router runs through,

@@ -430,6 +430,8 @@ type ChannelOutboundCardMessage struct {
 	Status               string             `json:"status"`
 	LastPatchedAt        pgtype.Timestamptz `json:"last_patched_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	CardEntityID         string             `json:"card_entity_id"`
+	LastSequence         int32              `json:"last_sequence"`
 }
 
 type ChannelOutboundMessage struct {
