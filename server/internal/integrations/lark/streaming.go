@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -32,16 +33,25 @@ import (
 //     the same reply position a plain reply would use (topic / native
 //     reply / chat level). task:running opens on a pending placeholder,
 //     which the first frame renders into;
-//   - further frames → buffered, and flushed as a FULL-content element
-//     update roughly every FlushInterval; Feishu's client typewriter-renders
-//     the suffix beyond the previous content. Thinking shows as a growing
-//     quote-block preview (frozen once it passes a size cap); the answer
-//     streams below a divider;
-//   - chat:done → one content update settles the card on the authoritative
-//     answer alone (the thinking preview drops away; the complete reasoning
-//     stays in the web transcript), then streaming mode closes;
-//     task:failed / task:cancelled annotate the live card and
-//     close. Row status ends final/error.
+//   - further frames → buffered, and flushed as FULL-content element
+//     updates roughly every FlushInterval. The card carries two
+//     independently-updated markdown elements: the answer streams
+//     append-only into the reply element (Feishu typewriter-renders the
+//     appended suffix as long as the old content is a prefix of the new),
+//     while the reasoning previews in its own element as a bounded window
+//     that follows the latest text — Lark renders a non-append update
+//     instantly, so the window reset reads as scrolling, not stutter.
+//     Keeping the regions in separate elements is what stops reasoning
+//     that arrives AFTER answer text (agentic tool loops) from rewriting
+//     the answer region: each element only ever grows on its own.
+//     Reasoning appearing on a live single-element card upgrades it to
+//     this split layout with one whole-card replace;
+//   - chat:done → one whole-card replace settles the card on the
+//     authoritative answer alone (the thinking box and divider drop away
+//     with no re-animation; the complete reasoning stays in the web
+//     transcript), then streaming mode closes; task:failed /
+//     task:cancelled annotate the card and close. Row status ends
+//     final/error.
 //
 // Coordination with the Patcher (the legacy whole-reply path): the claimed
 // DB row is the ownership signal. It is inserted synchronously on the event
@@ -102,9 +112,11 @@ type StreamingConfig struct {
 }
 
 const (
-	// streamElementID addresses the card's single markdown element in
-	// cardkit content updates. Lark caps element ids at 20 chars.
-	streamElementID = "reply_text"
+	// streamElementID addresses the card's reply markdown element and
+	// streamThinkElementID the thinking window in cardkit content updates.
+	// Lark caps element ids at 20 chars.
+	streamElementID      = "reply_text"
+	streamThinkElementID = "think_text"
 
 	defaultStreamFlushInterval = 1200 * time.Millisecond
 	defaultStreamMaxCardBytes  = 24_000
@@ -124,11 +136,15 @@ const (
 	streamTextType  = "text"
 	streamThinkType = "thinking"
 
-	// streamThinkPreviewRunes caps the live thinking preview (the quote
-	// block), keeping the streaming card bounded however long the agent
-	// reasons; the complete reasoning stays in the web transcript, never
-	// on the card.
-	streamThinkPreviewRunes = 2000
+	// The thinking preview is a bounded window over the reasoning buffer:
+	// it grows append-only (typewriter) until it passes the high-water
+	// mark, then one update resets it to the latest low-water runes —
+	// Lark renders a non-append update instantly, so the reset reads as
+	// the window scrolling forward instead of the card freezing at a cap.
+	// The bounds also keep the split card comfortably inside Feishu's 30KB
+	// card cap alongside a full-size reply.
+	streamThinkWindowLow  = 600
+	streamThinkWindowHigh = 1500
 )
 
 // NewStreamingReplier builds the streaming replier. Streaming is disabled
@@ -526,11 +542,20 @@ type streamState struct {
 	opCh chan streamOp
 
 	// worker-owned
-	cardID  string
-	seq     int32
-	flushed string
-	// placeholderShown records that the delivered card still holds the
-	// task-start placeholder, so the cancel path knows to replace it.
+	cardID string
+	seq    int32
+	// flushedReply / flushedThink are the last accepted contents of the
+	// card's reply and thinking elements.
+	flushedReply string
+	flushedThink string
+	// split records the card carrying the split layout (thinking window +
+	// divider + reply element); thinkAnchor is the rune offset the thinking
+	// window currently starts at.
+	split       bool
+	thinkAnchor int
+	// placeholderShown records that the reply element still holds a
+	// placeholder (the task-start pending marker or the split card's answer
+	// slot), so the cancel/fail paths know to replace it.
 	placeholderShown bool
 	// lastFlushAt stamps the latest accepted cardkit content push; the
 	// terminal close waits out the remainder of one flush window so the
@@ -672,61 +697,111 @@ func (st *streamState) idle() bool {
 	return st.sr.cfg.Now().Sub(st.lastActive) > streamIdleTimeout
 }
 
-// flush pushes the buffered text as one full-content update, creating and
-// delivering the card on first use.
+// flush pushes the buffered text as full-content element updates, creating
+// and delivering the card on first use. Each element grows append-only —
+// the reply with the answer, the thinking window with the latest reasoning —
+// so Lark's typewriter animates deltas and never re-renders settled text;
+// the window resets to the latest runes when it overflows, which Lark
+// renders instantly (the preview "scrolls").
 func (st *streamState) flush(ctx context.Context) {
 	st.mu.Lock()
 	thinking, answer := st.thinkBuf.String(), st.buf.String()
-	dirty := st.dirty
+	if st.cardID != "" && !st.dirty && (st.split || thinking == "") {
+		st.mu.Unlock()
+		return
+	}
+	// Frames may keep arriving while this flush pushes; restoring the flag
+	// on any failed push (a plain true-write cannot lose a concurrent
+	// append's mark) makes the next tick retry.
+	st.dirty = false
+	oversize := st.oversize
 	st.mu.Unlock()
 
-	var body string
-	switch {
-	case thinking != "" || answer != "":
-		body = renderStreamBody(thinking, answer)
-	case st.cardID == "":
-		// task:running opened the stream before any frame arrived; hold the
-		// screen with a pending placeholder until the first frame replaces it.
-		body = streamPendingPlaceholder
-	default:
+	if st.cardID == "" {
+		st.openCard(ctx, thinking, answer)
 		return
 	}
-	if !dirty && st.cardID != "" {
-		return
+
+	failed := false
+	if thinking != "" {
+		wantThink, anchor := renderThinkWindow(thinking, st.thinkAnchor)
+		switch {
+		case !st.split:
+			// Reasoning arrived on a live single-element card (text streams
+			// first, tools run, then the model reasons): upgrade the card to
+			// the split layout so the preview never rewrites the answer.
+			if st.ensureSplit(ctx, wantThink) {
+				st.thinkAnchor = anchor
+			} else {
+				failed = true
+			}
+		case wantThink != st.flushedThink:
+			if st.putContent(ctx, streamThinkElementID, wantThink) {
+				st.thinkAnchor = anchor
+			} else {
+				failed = true
+			}
+		}
 	}
-	if body == streamPendingPlaceholder {
-		st.placeholderShown = true
+
+	if answer != "" && !oversize {
+		wantReply := prependMarkdownMention(st.mentionOpenID, answer)
+		switch {
+		case wantReply == st.flushedReply:
+		case len(wantReply) > st.sr.cfg.MaxCardBytes:
+			// Keep buffering (finalize still has the full text), but stop
+			// growing the card — Feishu rejects cards over 30KB.
+			st.mu.Lock()
+			st.oversize = true
+			st.mu.Unlock()
+		case st.putContent(ctx, streamElementID, wantReply):
+			st.placeholderShown = false
+		default:
+			failed = true
+		}
 	}
-	full := prependMarkdownMention(st.mentionOpenID, body)
-	if len(full) > st.sr.cfg.MaxCardBytes {
-		// Keep buffering (finalize still has the full text), but stop
-		// growing the card — Feishu rejects cards over 30KB.
+
+	if failed {
 		st.mu.Lock()
-		st.oversize = true
-		st.dirty = false
+		st.dirty = true
 		st.mu.Unlock()
-		return
 	}
-	if !st.ensureCard(ctx, full) {
-		return
+}
+
+// openCard creates and delivers the card entity. A stream that already has
+// reasoning opens directly on the split layout (thinking window, divider,
+// answer slot); everything else opens on the single reply element.
+func (st *streamState) openCard(ctx context.Context, thinking, answer string) {
+	reply := streamPendingPlaceholder
+	var think string
+	var anchor int
+	if thinking != "" {
+		think, anchor = renderThinkWindow(thinking, st.thinkAnchor)
+		reply = streamReplySlotPlaceholder
 	}
-	if full == st.flushed {
-		st.mu.Lock()
-		st.dirty = false
-		st.mu.Unlock()
-		return
+	if answer != "" {
+		reply = prependMarkdownMention(st.mentionOpenID, answer)
 	}
-	st.putContent(ctx, full)
+	if st.ensureCard(ctx, reply, think) {
+		st.thinkAnchor = anchor
+		st.placeholderShown = answer == ""
+	}
 }
 
 // ensureCard lazily creates and delivers the card entity on the worker.
 // The first buffered text rides inside the created card, so no immediate
 // content update is needed after delivery.
-func (st *streamState) ensureCard(ctx context.Context, initialContent string) bool {
+func (st *streamState) ensureCard(ctx context.Context, replyContent, thinkContent string) bool {
 	if st.cardID != "" {
 		return true
 	}
-	cardJSON, err := buildStreamingCardJSON(initialContent)
+	var cardJSON string
+	var err error
+	if thinkContent != "" {
+		cardJSON, err = buildSplitCardJSON(thinkContent, replyContent)
+	} else {
+		cardJSON, err = buildReplyCardJSON(replyContent)
+	}
 	if err != nil {
 		st.sr.cfg.Logger.Warn("lark streaming: build card failed", "task_id", uuidString(st.taskID), "error", err)
 		return false
@@ -752,7 +827,9 @@ func (st *streamState) ensureCard(ctx context.Context, initialContent string) bo
 		return false
 	}
 	st.cardID = cardID
-	st.flushed = initialContent
+	st.flushedReply = replyContent
+	st.flushedThink = thinkContent
+	st.split = thinkContent != ""
 	st.lastFlushAt = st.sr.cfg.Now()
 	st.markActive()
 	if err := st.sr.queries.SetLarkOutboundCardIdentity(ctx, SetOutboundCardIdentityParams{
@@ -767,13 +844,40 @@ func (st *streamState) ensureCard(ctx context.Context, initialContent string) bo
 	return true
 }
 
-// putContent replaces the element content (full text) and persists the
-// accepted sequence. Failures leave the buffer dirty so the next tick
-// retries with the full content — self-healing against transient errors.
-func (st *streamState) putContent(ctx context.Context, full string) bool {
+// ensureSplit upgrades a live single-element card to the split layout with
+// one whole-card replace: the thinking window (in its own element) sits
+// above the divider, the reply element carries over below. Lark renders the
+// replace instantly; because the reply content is unchanged, the answer's
+// typewriter is not disturbed.
+func (st *streamState) ensureSplit(ctx context.Context, thinkContent string) bool {
+	reply := st.flushedReply
+	if st.placeholderShown {
+		// The pending placeholder becomes the quiet answer-slot marker.
+		reply = streamReplySlotPlaceholder
+	}
+	st.typewriterGrace()
+	cardJSON, err := buildSplitCardJSON(thinkContent, reply)
+	if err != nil {
+		st.sr.cfg.Logger.Warn("lark streaming: build split card failed", "task_id", uuidString(st.taskID), "error", err)
+		return false
+	}
+	if !st.replaceCard(ctx, cardJSON) {
+		return false
+	}
+	st.split = true
+	st.flushedThink = thinkContent
+	st.flushedReply = reply
+	return true
+}
+
+// putContent replaces one element's content (full text) and persists the
+// accepted sequence. Failures leave the retry to the next flush, which
+// re-renders from the live buffers — self-healing against transient errors.
+func (st *streamState) putContent(ctx context.Context, elementID, content string) bool {
 	// Budget guard: an over-cap push would be rejected by Feishu anyway;
-	// the oversize branches own delivering the full text elsewhere.
-	if len(full) > st.sr.cfg.MaxCardBytes {
+	// the oversize branches own delivering the full text elsewhere. Lark
+	// also rejects empty content, so nothing to push means no call.
+	if content == "" || len(content) > st.sr.cfg.MaxCardBytes {
 		return false
 	}
 	startSeq := st.seq
@@ -781,8 +885,8 @@ func (st *streamState) putContent(ctx context.Context, full string) bool {
 	err := st.sr.cards.UpdateCardElementContent(ctx, UpdateCardElementContentParams{
 		InstallationID: st.creds,
 		CardID:         st.cardID,
-		ElementID:      streamElementID,
-		Content:        full,
+		ElementID:      elementID,
+		Content:        content,
 		Sequence:       st.seq,
 	})
 	if isCardStreamingClosedError(err) {
@@ -799,8 +903,8 @@ func (st *streamState) putContent(ctx context.Context, full string) bool {
 			err = st.sr.cards.UpdateCardElementContent(ctx, UpdateCardElementContentParams{
 				InstallationID: st.creds,
 				CardID:         st.cardID,
-				ElementID:      streamElementID,
-				Content:        full,
+				ElementID:      elementID,
+				Content:        content,
 				Sequence:       st.seq,
 			})
 		}
@@ -813,15 +917,12 @@ func (st *streamState) putContent(ctx context.Context, full string) bool {
 		// push heals either way.
 		st.seq = startSeq
 		st.sr.cfg.Logger.Warn("lark streaming: content update failed",
-			"task_id", uuidString(st.taskID), "card_id", st.cardID, "error", err)
+			"task_id", uuidString(st.taskID), "card_id", st.cardID, "element_id", elementID, "error", err)
 		return false
 	}
-	st.flushed = full
+	st.flushedElement(elementID, content)
 	st.lastFlushAt = st.sr.cfg.Now()
 	st.markActive()
-	st.mu.Lock()
-	st.dirty = false
-	st.mu.Unlock()
 	_ = st.sr.queries.UpdateLarkOutboundCardProgress(ctx, UpdateOutboundCardProgressParams{
 		ID:           st.cardRowID,
 		LastSequence: st.seq,
@@ -830,10 +931,19 @@ func (st *streamState) putContent(ctx context.Context, full string) bool {
 	return true
 }
 
+// flushedElement records the accepted content of one element.
+func (st *streamState) flushedElement(elementID, content string) {
+	if elementID == streamThinkElementID {
+		st.flushedThink = content
+		return
+	}
+	st.flushedReply = content
+}
+
 // finalize settles the card on the authoritative reply alone: the chat:done
-// content replaces the streamed approximation — dropping the thinking
-// preview, whose complete version lives on in the web transcript — then
-// streaming mode closes and the row becomes final.
+// content replaces the streamed approximation — dropping the thinking box,
+// whose complete version lives on in the web transcript — then streaming
+// mode closes and the row becomes final.
 func (st *streamState) finalize(ctx context.Context, authoritative string) {
 	buf := st.snapshot()
 	st.mu.Lock()
@@ -871,37 +981,64 @@ func (st *streamState) finalize(ctx context.Context, authoritative string) {
 		// legacy path.
 		truncated := prependMarkdownMention(st.mentionOpenID,
 			truncateCardTail(authoritative, st.sr.cfg.MaxCardBytes))
-		if truncated != st.flushed {
-			st.putContent(ctx, truncated)
-		}
-		st.closeStreaming(ctx)
-		st.persistProgress(ctx, CardStatusFinal)
+		st.settleFinalCard(ctx, truncated)
 		st.sr.legacySendForState(ctx, st, authoritative)
 		return
 	}
 
-	if full != st.flushed {
-		st.putContent(ctx, full)
+	st.settleFinalCard(ctx, full)
+}
+
+// settleFinalCard lands the terminal answer-only card. On the split layout
+// one whole-card replace drops the thinking box and divider; the reply
+// content carries over unchanged, so nothing re-animates. A failed (or
+// unbuildable) replace degrades to updating the reply element in place,
+// leaving the frozen thinking box visible above the answer.
+func (st *streamState) settleFinalCard(ctx context.Context, finalReply string) {
+	if finalReply != "" && st.split {
+		st.typewriterGrace()
+		if cardJSON, err := buildReplyCardJSON(finalReply); err == nil && st.replaceCard(ctx, cardJSON) {
+			st.flushedReply = finalReply
+			st.closeStreaming(ctx)
+			st.persistProgress(ctx, CardStatusFinal)
+			return
+		}
+	}
+	if finalReply != "" && finalReply != st.flushedReply {
+		st.putContent(ctx, streamElementID, finalReply)
 	}
 	st.closeStreaming(ctx)
 	st.persistProgress(ctx, CardStatusFinal)
 }
 
-// snapshotThinking returns the buffered thinking text.
-func (st *streamState) snapshotThinking() string {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.thinkBuf.String()
+// replaceCard swaps the card's whole document for cardJSON, consuming one
+// sequence like every card operation. It lets the live typewriter finish
+// first when the caller graces: the replace re-renders instantly and would
+// cut the animation short.
+func (st *streamState) replaceCard(ctx context.Context, cardJSON string) bool {
+	st.seq++
+	err := st.sr.cards.UpdateCardEntity(ctx, UpdateCardEntityParams{
+		InstallationID: st.creds,
+		CardID:         st.cardID,
+		CardJSON:       cardJSON,
+		UUID:           uuid.New().String(),
+		Sequence:       st.seq,
+	})
+	if err != nil {
+		st.sr.cfg.Logger.Warn("lark streaming: card replace failed",
+			"task_id", uuidString(st.taskID), "card_id", st.cardID, "error", err)
+		return false
+	}
+	st.markActive()
+	return true
 }
 
 // fail surfaces a short failure note on the card after the partial output,
 // mirroring the Patcher's error card semantics (visual distinction for a
-// failed run) without dropping what already streamed. The card keeps its
-// live layout (thinking preview + partial answer); the legacy fallback only
-// ever carries the answer, never the reasoning.
+// failed run) without dropping what already streamed. The note rides the
+// reply element; the thinking window (if any) keeps its last state above it.
 func (st *streamState) fail(ctx context.Context, errMessage string) {
 	partial := st.snapshot()
-	thinking := st.snapshotThinking()
 	if st.cardID == "" {
 		if partial != "" {
 			st.sr.legacySendForState(ctx, st, partial+streamFailureSuffix(errMessage))
@@ -909,10 +1046,10 @@ func (st *streamState) fail(ctx context.Context, errMessage string) {
 		_ = st.sr.queries.UpdateLarkOutboundCardStatus(ctx, UpdateOutboundCardStatusParams{ID: st.cardRowID, Status: string(CardStatusError)})
 		return
 	}
-	full := prependMarkdownMention(st.mentionOpenID,
-		appendBodySuffix(renderStreamBody(thinking, partial), streamFailureSuffix(errMessage)))
-	if full != st.flushed {
-		st.putContent(ctx, full)
+	reply := prependMarkdownMention(st.mentionOpenID,
+		appendBodySuffix(partial, streamFailureSuffix(errMessage)))
+	if reply != st.flushedReply {
+		st.putContent(ctx, streamElementID, reply)
 	}
 	st.closeStreaming(ctx)
 	st.persistProgress(ctx, CardStatusError)
@@ -922,7 +1059,7 @@ func (st *streamState) fail(ctx context.Context, errMessage string) {
 // stay silent on cancellation, but a card already on screen must not keep
 // showing a live typewriter forever. A cancelled run that never produced an
 // answer would otherwise leave the thinking preview reading as in-progress
-// work, so it gets an explicit cancel marker instead.
+// work, so the reply slot states the cancellation instead.
 func (st *streamState) settle(ctx context.Context) {
 	if st.cardID == "" {
 		_ = st.sr.queries.UpdateLarkOutboundCardStatus(ctx, UpdateOutboundCardStatusParams{ID: st.cardRowID, Status: string(CardStatusFinal)})
@@ -930,23 +1067,24 @@ func (st *streamState) settle(ctx context.Context) {
 	}
 	thinking, answer := st.snapshotBoth()
 	if answer == "" && (thinking != "" || st.placeholderShown) {
-		cancelled := prependMarkdownMention(st.mentionOpenID,
-			appendBodySuffix(renderStreamBody(thinking, ""), streamCancelSuffix))
-		if cancelled != st.flushed {
-			st.putContent(ctx, cancelled)
+		cancelled := prependMarkdownMention(st.mentionOpenID, appendBodySuffix("", streamCancelSuffix))
+		if cancelled != st.flushedReply {
+			st.putContent(ctx, streamElementID, cancelled)
 		}
 	}
 	st.closeStreaming(ctx)
 	st.persistProgress(ctx, CardStatusFinal)
 }
 
-// settleWithContent is settle preceded by one authoritative content push,
-// used by the restart-recovery path where nothing else will update the card.
+// settleWithContent is settle preceded by the authoritative content, used by
+// the restart-recovery path where nothing else will update the card. The
+// recovered worker does not know the card's layout, so it targets the reply
+// element — present in both layouts; a split card keeps its frozen thinking
+// box, an acceptable degradation for restart recovery.
 func (st *streamState) settleWithContent(ctx context.Context, content string) {
 	if content != "" {
-		if full := prependMarkdownMention(st.mentionOpenID, content); full != st.flushed {
-			st.putContent(ctx, full)
-		}
+		st.settleFinalCard(ctx, prependMarkdownMention(st.mentionOpenID, content))
+		return
 	}
 	st.settle(ctx)
 }
@@ -1131,12 +1269,14 @@ func isCardStreamingClosedError(err error) bool {
 	return code == codeCardStreamingClosed || code == codeCardStreamingTimeout
 }
 
-// streamFailureSuffix is the failure marker appended to a streamed card.
+// streamFailureSuffix is the failure marker appended to a streamed card;
+// appendBodySuffix strips its divider when there is no partial answer to
+// follow.
 func streamFailureSuffix(errMessage string) string {
 	if errMessage == "" {
-		return "\n\n---\n⚠️ 运行失败。"
+		return "\n\n---\n\n⚠️ 运行失败。"
 	}
-	return "\n\n---\n⚠️ 运行失败：" + errMessage
+	return "\n\n---\n\n⚠️ 运行失败：" + errMessage
 }
 
 // truncateCardTail cuts content to fit the card budget and ends on a note
@@ -1161,13 +1301,13 @@ func isUTF8Start(b byte) bool { return b&0xC0 != 0x80 }
 
 // streamThinkLabel heads the live thinking preview; streamCancelSuffix marks
 // a run cancelled before any answer; streamPendingPlaceholder holds the
-// screen between task start and the first frame; streamThinkFreezeNote ends
-// a preview frozen at the cap and points at the web transcript for the rest.
+// screen between task start and the first frame; streamReplySlotPlaceholder
+// marks the split card's answer slot while only reasoning has arrived.
 const (
-	streamThinkLabel         = "Thinking"
-	streamCancelSuffix       = "\n\n---\n\n_已取消_"
-	streamPendingPlaceholder = "Thinking…"
-	streamThinkFreezeNote    = "\n\n…（思考较长，实时预览已暂停；完整内容见网页端任务记录）"
+	streamThinkLabel           = "Thinking"
+	streamCancelSuffix         = "\n\n---\n\n_已取消_"
+	streamPendingPlaceholder   = "Thinking…"
+	streamReplySlotPlaceholder = "…"
 )
 
 // appendBodySuffix joins a suffix onto a possibly-empty body without leaving
@@ -1179,48 +1319,66 @@ func appendBodySuffix(body, suffix string) string {
 	return body + suffix
 }
 
-// renderStreamBody composes the live card body from the thinking and answer
-// buffers. Thinking rides as a quoted preview under a fixed header; the
-// answer streams below a divider once it starts. Every piece only ever
-// grows — header, quote and divider are stable, the preview freezes (never
-// slides) once thinking passes the cap, and the answer appends — so each
-// rendered body extends the previous one. That is the precondition for
-// Feishu's typewriter to animate only the delta: any render that changes
-// the head of the text makes the client clear and retype the whole block.
-func renderStreamBody(thinking, answer string) string {
-	if thinking == "" {
-		return answer
-	}
-	var b strings.Builder
-	b.WriteString("**" + streamThinkLabel + "**\n\n")
-	b.WriteString(quoteBlock(thinkingPreview(thinking)))
-	if answer != "" {
-		b.WriteString("\n\n---\n\n")
-		b.WriteString(answer)
-	}
-	return b.String()
-}
-
 // quoteBlock turns text into a markdown quote, one "> " per line.
 func quoteBlock(text string) string {
 	return "> " + strings.ReplaceAll(text, "\n", "\n> ")
 }
 
-// thinkingPreview bounds the live reasoning text for the card. It freezes at
-// the head once the text passes the rune cap, appending the cut note — the
-// result always extends the previous render, which renderStreamBody's
-// typewriter contract requires. The cap only bounds the transient live
-// preview; the web transcript keeps the complete reasoning.
-func thinkingPreview(text string) string {
-	runes := []rune(text)
-	if len(runes) <= streamThinkPreviewRunes {
-		return text
+// renderThinkWindow renders the thinking preview and the rune anchor its
+// content starts from. The window grows append-only until it passes the
+// high-water mark; then the anchor jumps so the render shows the latest
+// low-water runes under an ellipsis marker. A growth render always extends
+// the previous one — the precondition for Feishu's typewriter to animate
+// only the delta — while a reset render changes the head on purpose: Lark
+// puts non-append updates on screen instantly, which reads as the window
+// scrolling forward. The anchor only ever advances past committed pushes.
+func renderThinkWindow(thinking string, anchor int) (content string, next int) {
+	runes := []rune(thinking)
+	if len(runes)-anchor > streamThinkWindowHigh {
+		anchor = len(runes) - streamThinkWindowLow
 	}
-	return string(runes[:streamThinkPreviewRunes]) + streamThinkFreezeNote
+	window := string(runes[anchor:])
+	if anchor > 0 {
+		window = "…\n\n" + window
+	}
+	return "**" + streamThinkLabel + "**\n\n" + quoteBlock(window), anchor
+}
+
+// buildReplyCardJSON renders the single-element answer card: the shape a
+// stream opens on without reasoning and the shape every finalize settles
+// into.
+func buildReplyCardJSON(content string) (string, error) {
+	return buildStreamingCardJSON([]any{
+		map[string]any{
+			"tag":        "markdown",
+			"content":    content,
+			"element_id": streamElementID,
+		},
+	})
+}
+
+// buildSplitCardJSON renders the live reasoning layout: the thinking window,
+// a divider, and the reply element below it. Both markdown elements carry
+// their own element_id so content updates address them independently — the
+// precondition for each region growing without rewriting the other.
+func buildSplitCardJSON(thinkContent, replyContent string) (string, error) {
+	return buildStreamingCardJSON([]any{
+		map[string]any{
+			"tag":        "markdown",
+			"content":    thinkContent,
+			"element_id": streamThinkElementID,
+		},
+		map[string]any{"tag": "hr"},
+		map[string]any{
+			"tag":        "markdown",
+			"content":    replyContent,
+			"element_id": streamElementID,
+		},
+	})
 }
 
 // buildStreamingCardJSON renders the cardkit card document: schema 2.0,
-// streaming mode on, one markdown element the content updates address.
+// streaming mode on, and the given body elements.
 //
 // Typewriter pacing is tuned to generation speed, not to Feishu's 70 ms x 1
 // default (~14 chars/s): agent models emit hundreds of characters a second,
@@ -1230,7 +1388,7 @@ func thinkingPreview(text string) string {
 // typewriter continuously busy and the card tracks the agent in near real
 // time. (The fast strategy instead dumps any un-rendered backlog the moment
 // a new update lands, which reads as bursts interrupting the typing.)
-func buildStreamingCardJSON(initialContent string) (string, error) {
+func buildStreamingCardJSON(elements []any) (string, error) {
 	doc := map[string]any{
 		"schema": "2.0",
 		"config": map[string]any{
@@ -1245,13 +1403,7 @@ func buildStreamingCardJSON(initialContent string) (string, error) {
 			},
 		},
 		"body": map[string]any{
-			"elements": []any{
-				map[string]any{
-					"tag":        "markdown",
-					"content":    initialContent,
-					"element_id": streamElementID,
-				},
-			},
+			"elements": elements,
 		},
 	}
 	raw, err := json.Marshal(doc)

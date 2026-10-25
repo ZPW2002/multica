@@ -2,6 +2,7 @@ package lark
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -106,12 +107,14 @@ type fakeStreamingAPIClient struct {
 	cardMessages  []SendCardMessageParams
 	contentCalls  []UpdateCardElementContentParams
 	settingsCalls []SetCardStreamingModeParams
+	cardReplaces  []UpdateCardEntityParams
 	mdCards       []SendMarkdownCardParams
 	texts         []SendTextParams
 
 	createErr   error
 	sendErr     error
 	contentErrs []error // consumed per content call, nil once exhausted
+	replaceErr  error
 }
 
 func (f *fakeStreamingAPIClient) CreateCardEntity(ctx context.Context, p CreateCardEntityParams) (string, error) {
@@ -152,6 +155,13 @@ func (f *fakeStreamingAPIClient) SetCardStreamingMode(ctx context.Context, p Set
 	return nil
 }
 
+func (f *fakeStreamingAPIClient) UpdateCardEntity(ctx context.Context, p UpdateCardEntityParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cardReplaces = append(f.cardReplaces, p)
+	return f.replaceErr
+}
+
 func (f *fakeStreamingAPIClient) SendMarkdownCard(ctx context.Context, p SendMarkdownCardParams) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -177,6 +187,18 @@ func (f *fakeStreamingAPIClient) lastContentLocked() string {
 		return ""
 	}
 	return f.contentCalls[len(f.contentCalls)-1].Content
+}
+
+// lastContentFor returns the latest pushed content of one element.
+func (f *fakeStreamingAPIClient) lastContentFor(elementID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.contentCalls) - 1; i >= 0; i-- {
+		if f.contentCalls[i].ElementID == elementID {
+			return f.contentCalls[i].Content
+		}
+	}
+	return ""
 }
 
 func (f *fakeStreamingAPIClient) settled() bool {
@@ -353,9 +375,10 @@ func TestStreamingDeliversCardWithoutWaitingForFlushInterval(t *testing.T) {
 }
 
 // TestStreamingThinkingPreviewDropsAtFinalize pins the thinking display:
-// the card opens on the first thinking frame quoting the reasoning, the
-// answer streams below a divider, and finalize settles the card on the
-// authoritative answer alone — no thinking header or quote remains.
+// the card opens on the first thinking frame in the split layout (window,
+// divider, answer slot), the answer streams into the reply element, and
+// finalize replaces the card with the answer alone — no thinking header,
+// window, or divider remains.
 func TestStreamingThinkingPreviewDropsAtFinalize(t *testing.T) {
 	s, api, _ := newStreamEnv(t, nil)
 
@@ -368,24 +391,116 @@ func TestStreamingThinkingPreviewDropsAtFinalize(t *testing.T) {
 	if !strings.Contains(embedded, "Thinking") || !strings.Contains(embedded, "先分析问题") {
 		t.Fatalf("card should open with the thinking preview: %s", embedded)
 	}
+	if !strings.Contains(embedded, streamReplySlotPlaceholder) {
+		t.Fatalf("split card should carry the answer-slot placeholder: %s", embedded)
+	}
 
 	s.handleEvent(textEvent("答案"))
-	eventually(t, func() bool {
-		got := api.lastContent()
-		return strings.Contains(got, "---") && strings.Contains(got, "答案")
-	}, "answer streams below the divider")
+	eventually(t, func() bool { return api.lastContentFor(streamElementID) == "答案" },
+		"answer streams into the reply element")
 
 	s.handleEvent(doneEvent("答案（完整）"))
 
 	eventually(t, func() bool {
 		api.mu.Lock()
 		defer api.mu.Unlock()
-		return api.settledLocked() && api.lastContentLocked() == "答案（完整）"
-	}, "finalize settles the card on the answer alone")
+		return api.settledLocked() && len(api.cardReplaces) == 1
+	}, "finalize replaces the card with the answer-only layout")
 
-	if got := api.lastContent(); strings.Contains(got, "Thinking") || strings.Contains(got, "先分析问题") {
-		t.Fatalf("final card must not carry thinking content, got %q", got)
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	final := replyContentFromCardJSON(t, api.cardReplaces[0].CardJSON)
+	if final != "答案（完整）" {
+		t.Fatalf("final card must carry the authoritative answer, got %q", final)
 	}
+	if strings.Contains(api.cardReplaces[0].CardJSON, streamThinkElementID) || strings.Contains(api.cardReplaces[0].CardJSON, "先分析问题") {
+		t.Fatalf("final card must drop the thinking window: %s", api.cardReplaces[0].CardJSON)
+	}
+}
+
+// TestStreamingThinkingAfterAnswerNeverRewritesAnswer pins the fix for the
+// interleave twitch: reasoning that arrives AFTER answer text has streamed
+// must never rewrite the answer region. Lark renders any non-append content
+// update instantly, which used to re-render the whole single-element card on
+// every flush; with the split layout the thinking window lives in its own
+// element and the reply element only ever receives prefix-extensions.
+func TestStreamingThinkingAfterAnswerNeverRewritesAnswer(t *testing.T) {
+	s, api, _ := newStreamEnv(t, nil)
+
+	s.handleEvent(textEvent("先说结论"))
+	waitForCard(t, api)
+	s.handleEvent(thinkingEvent("现在开始思考细节"))
+	eventually(t, func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		return len(api.cardReplaces) == 1
+	}, "card upgrades to the split layout when reasoning follows text")
+
+	api.mu.Lock()
+	upgrade := api.cardReplaces[0].CardJSON
+	api.mu.Unlock()
+	if !strings.Contains(upgrade, streamThinkElementID) || !strings.Contains(upgrade, "先说结论") {
+		t.Fatalf("upgrade must install the thinking window and carry the answer over: %s", upgrade)
+	}
+
+	s.handleEvent(thinkingEvent("，继续思考"))
+	s.handleEvent(textEvent("，然后补充"))
+	s.handleEvent(textEvent("更多"))
+	s.handleEvent(doneEvent("先说结论，然后补充更多"))
+
+	eventually(t, func() bool { return api.settled() }, "finalized")
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	var last string
+	for _, c := range api.contentCalls {
+		switch c.ElementID {
+		case streamElementID:
+			if last != "" && !strings.HasPrefix(c.Content, last) {
+				t.Fatalf("reply element rewritten mid-stream (twitch):\n  %q\n→ %q", last, c.Content)
+			}
+			last = c.Content
+			if strings.Contains(c.Content, "思考") || strings.Contains(c.Content, streamThinkLabel) {
+				t.Fatalf("reply element must never carry thinking: %q", c.Content)
+			}
+		case streamThinkElementID:
+			if strings.Contains(c.Content, "先说结论") {
+				t.Fatalf("thinking element must never carry the answer: %q", c.Content)
+			}
+		}
+	}
+	if len(api.cardReplaces) != 2 {
+		t.Fatalf("want upgrade + final replaces, got %d", len(api.cardReplaces))
+	}
+	final := api.cardReplaces[len(api.cardReplaces)-1].CardJSON
+	if !strings.Contains(final, "先说结论，然后补充更多") || strings.Contains(final, streamThinkElementID) {
+		t.Fatalf("final card must be the answer alone: %s", final)
+	}
+}
+
+// TestStreamingThinkingWindowScrolls pins the liveness contract: past the
+// high-water mark the preview keeps moving — the window resets to the latest
+// runes instead of freezing at a cap.
+func TestStreamingThinkingWindowScrolls(t *testing.T) {
+	s, api, _ := newStreamEnv(t, nil)
+
+	s.handleEvent(thinkingEvent(strings.Repeat("H", streamThinkWindowHigh)))
+	waitForCard(t, api)
+	s.handleEvent(thinkingEvent(strings.Repeat("T", streamThinkWindowHigh) + "尾"))
+
+	eventually(t, func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		for _, c := range api.contentCalls {
+			if c.ElementID == streamThinkElementID &&
+				strings.Contains(c.Content, "尾") &&
+				strings.Contains(c.Content, "…") &&
+				!strings.Contains(c.Content, "H") {
+				return true
+			}
+		}
+		return false
+	}, "window scrolls to the latest reasoning after overflow")
 }
 
 // TestStreamingCancelDuringThinkingMarksCard: a run cancelled before any
@@ -419,8 +534,11 @@ func TestStreamingOpensCardAtTaskRunning(t *testing.T) {
 	}, "card opens at task start with the pending placeholder")
 
 	s.handleEvent(thinkingEvent("开始想"))
-	eventually(t, func() bool { return strings.Contains(api.lastContent(), "开始想") },
-		"first thinking frame replaces the placeholder")
+	eventually(t, func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		return len(api.cardReplaces) == 1 && strings.Contains(api.cardReplaces[0].CardJSON, "开始想")
+	}, "first thinking frame upgrades the placeholder card to the split layout")
 }
 
 // TestStreamingFramesJoinByDaemonSealing mirrors the daemon reporter's frame
@@ -536,9 +654,9 @@ func TestStreamingOversizeTruncatesCardAndSendsLegacy(t *testing.T) {
 }
 
 // TestStreamingOversizeWithThinkingDropsPreview pins the oversize finalize
-// path with thinking on screen: the truncated tail shows the answer only
-// (thinking drops away like any finalize), fits MaxCardBytes, and the full
-// reply rides the legacy path.
+// path with thinking on screen: the whole-card replace lands a truncated,
+// answer-only reply that fits MaxCardBytes (thinking drops away like any
+// finalize), and the full reply rides the legacy path.
 func TestStreamingOversizeWithThinkingDropsPreview(t *testing.T) {
 	s, api, _ := newStreamEnv(t, nil)
 	s.cfg.MaxCardBytes = 2000
@@ -548,23 +666,25 @@ func TestStreamingOversizeWithThinkingDropsPreview(t *testing.T) {
 	s.handleEvent(doneEvent(strings.Repeat("字", 1000)))
 
 	// The plain-字 reply carries no markdown, so the legacy fallback sends
-	// it as text; waiting on the send itself (not settled(), which lands
-	// before it) keeps the assertions race-free.
+	// it as text; waiting on the sends themselves (not settled(), which
+	// lands around them) keeps the assertions race-free.
 	eventually(t, func() bool {
 		api.mu.Lock()
 		defer api.mu.Unlock()
-		return api.settledLocked() && len(api.texts) == 1
-	}, "oversize finalize settles and sends the full reply on the legacy path")
+		return api.settledLocked() && len(api.texts) == 1 && len(api.cardReplaces) == 1
+	}, "oversize finalize settles, replaces the card, and sends the legacy reply")
 
-	last := api.lastContent()
-	if len(last) > s.cfg.MaxCardBytes {
-		t.Fatalf("truncated card exceeds cap: %d bytes", len(last))
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	final := replyContentFromCardJSON(t, api.cardReplaces[0].CardJSON)
+	if len(final) > s.cfg.MaxCardBytes {
+		t.Fatalf("truncated card exceeds cap: %d bytes", len(final))
 	}
-	if !strings.Contains(last, "完整回复见下一条消息") {
-		t.Fatalf("truncated answer should carry the pointer suffix: %q", last[:min(60, len(last))])
+	if !strings.Contains(final, "完整回复见下一条消息") {
+		t.Fatalf("truncated answer should carry the pointer suffix: %q", final[:min(60, len(final))])
 	}
-	if strings.Contains(last, "Thinking") || strings.Contains(last, "思") {
-		t.Fatalf("oversize finalize must drop the thinking preview, got %q", last[:min(60, len(last))])
+	if strings.Contains(final, "Thinking") || strings.Contains(final, "思") {
+		t.Fatalf("oversize finalize must drop the thinking window, got %q", final[:min(60, len(final))])
 	}
 }
 
@@ -715,41 +835,44 @@ func TestPatcherSkipsWhenStreamingCardClaimed(t *testing.T) {
 	}
 }
 
-func TestRenderStreamBody(t *testing.T) {
-	// Answer only: passes through untouched.
-	if got := renderStreamBody("", "ans"); got != "ans" {
-		t.Fatalf("no thinking should pass the answer through, got %q", got)
+func TestRenderThinkWindow(t *testing.T) {
+	// Small buffer: the full text quoted under the header.
+	got, anchor := renderThinkWindow("想", 0)
+	if anchor != 0 || !strings.HasPrefix(got, "**Thinking**\n\n> 想") {
+		t.Fatalf("window malformed: %q anchor=%d", got, anchor)
 	}
-	// Thinking only: header + quoted preview.
-	got := renderStreamBody("想", "")
-	if !strings.HasPrefix(got, "**Thinking**\n\n> 想") {
-		t.Fatalf("thinking-only body malformed: %q", got)
+	// Growth keeps the head: the render extends the previous one, so the
+	// typewriter animates only the delta.
+	grown, _ := renderThinkWindow("想一二三", 0)
+	if !strings.HasPrefix(grown, got) {
+		t.Fatalf("growth must extend the previous render:\n%q\n→ %q", got, grown)
 	}
-	// Thinking + answer: preview, divider, then the answer — all stable
-	// prefixes, so consecutive renders keep the typewriter animating deltas.
-	got = renderStreamBody("想", "答")
-	if !strings.HasPrefix(got, "**Thinking**\n\n> 想\n\n---\n\n答") {
-		t.Fatalf("composed body malformed: %q", got)
+	// Past the high-water mark the window resets to the latest runes under
+	// an ellipsis marker. The head changes on purpose: Lark renders
+	// non-append updates instantly, which reads as the window scrolling
+	// forward rather than the card freezing at a cap.
+	base := "头" + strings.Repeat("H", streamThinkWindowHigh)
+	over := base + strings.Repeat("T", 700) + "尾"
+	reset, next := renderThinkWindow(over, 0)
+	if want := len([]rune(over)) - streamThinkWindowLow; next != want {
+		t.Fatalf("reset anchor: got %d want %d", next, want)
 	}
-	// Past the cap the preview freezes at the head with a cut note. The
-	// over-cap render must EXTEND the at-cap render: Feishu's typewriter
-	// animates only appended deltas, and any render that changes the head
-	// of the text makes the client clear and retype the whole block.
-	atCap := strings.Repeat("思", streamThinkPreviewRunes)
-	over := renderStreamBody(atCap+"溢", "")
-	if !strings.HasPrefix(over, renderStreamBody(atCap, "")) {
-		t.Fatal("over-cap preview must extend the at-cap render, not replace it")
+	if !strings.Contains(reset, "…") || !strings.Contains(reset, "尾") {
+		t.Fatalf("reset window should carry the marker and latest runes: %q", reset[:min(80, len(reset))])
 	}
-	if !strings.Contains(over, "实时预览已暂停") {
-		t.Fatalf("frozen preview should carry the cut note: %q", over[:min(80, len(over))])
+	if strings.Contains(reset, "头") || strings.Contains(reset, "H") {
+		t.Fatal("reset window must drop the overflowed head")
 	}
-	if strings.Contains(over, "溢") {
-		t.Fatal("frozen preview must not render runes past the cap")
+	// After a reset, growth extends the reset render — the typewriter
+	// resumes from the window's head.
+	resume, _ := renderThinkWindow(over+"加", next)
+	if !strings.HasPrefix(resume, reset) {
+		t.Fatalf("post-reset growth must extend the reset render:\n%q\n→ %q", reset, resume)
 	}
 }
 
 func TestBuildStreamingCardJSON(t *testing.T) {
-	raw, err := buildStreamingCardJSON("seed")
+	raw, err := buildReplyCardJSON("seed")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -769,6 +892,50 @@ func TestBuildStreamingCardJSON(t *testing.T) {
 			t.Fatalf("card JSON missing %s: %s", want, raw)
 		}
 	}
+
+	// The split layout puts the thinking window, a divider, and the reply
+	// element in the same card, each markdown addressable by its own id.
+	split, err := buildSplitCardJSON("**Thinking**\n\n> 想", streamReplySlotPlaceholder)
+	if err != nil {
+		t.Fatalf("build split: %v", err)
+	}
+	for _, want := range []string{
+		`"element_id":"think_text"`,
+		`"tag":"hr"`,
+		`"element_id":"reply_text"`,
+		// json.Marshal HTML-escapes ">" as \u003e; Lark parses the escape.
+		`"content":"**Thinking**\n\n\u003e 想"`,
+		`"content":"…"`,
+	} {
+		if !strings.Contains(split, want) {
+			t.Fatalf("split card JSON missing %s: %s", want, split)
+		}
+	}
+}
+
+// replyContentFromCardJSON extracts the reply element's content from a
+// serialized card document.
+func replyContentFromCardJSON(t *testing.T, raw string) string {
+	t.Helper()
+	var doc struct {
+		Body struct {
+			Elements []struct {
+				Tag       string `json:"tag"`
+				ElementID string `json:"element_id"`
+				Content   string `json:"content"`
+			} `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("parse card json: %v (raw=%s)", err, raw)
+	}
+	for _, el := range doc.Body.Elements {
+		if el.ElementID == streamElementID {
+			return el.Content
+		}
+	}
+	t.Fatalf("reply element missing from card: %s", raw)
+	return ""
 }
 
 func TestTruncateCardTail(t *testing.T) {

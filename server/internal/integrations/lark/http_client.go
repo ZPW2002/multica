@@ -663,6 +663,50 @@ func (c *httpAPIClient) SetCardStreamingMode(ctx context.Context, p SetCardStrea
 	return nil
 }
 
+// UpdateCardEntity implements CardStreamingClient:
+// PUT /cardkit/v1/cards/{card_id} with type=card_json, replacing the card's
+// whole document. Like creation, the new card JSON travels string-encoded
+// inside the body. UUID is Lark's idempotency key: a retried operation with
+// the same UUID is deduplicated instead of double-applied.
+func (c *httpAPIClient) UpdateCardEntity(ctx context.Context, p UpdateCardEntityParams) error {
+	if p.CardID == "" {
+		return errors.New("lark http client: missing card id")
+	}
+	if p.CardJSON == "" {
+		return errors.New("lark http client: missing card json")
+	}
+	if p.Sequence < 1 {
+		return errors.New("lark http client: sequence must be a positive int32")
+	}
+	// Unlike creation (flat type/data at the top level), the update body
+	// nests them under a "card" object: {sequence, uuid, card:{type,data}}.
+	// Verified against the API — the flat shape fails with 99992402
+	// "card is required".
+	body := map[string]any{
+		"uuid":     p.UUID,
+		"sequence": p.Sequence,
+		"card": map[string]string{
+			"type": "card_json",
+			"data": p.CardJSON,
+		},
+	}
+	path := "/open-apis/cardkit/v1/cards/" + url.PathEscape(p.CardID)
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := c.doAuthedJSON(ctx, p.InstallationID, http.MethodPut, path, body, &resp); err != nil {
+		return fmt.Errorf("lark http client: update card entity: %w", err)
+	}
+	if resp.Code != 0 {
+		if isTokenError(resp.Code) {
+			c.invalidateToken(p.InstallationID.AppID)
+		}
+		return &APIError{Op: "update card entity", Code: resp.Code, Msg: resp.Msg}
+	}
+	return nil
+}
+
 // SendBindingPromptCard renders the member-binding card and posts it
 // directly to the unbound user's open_id (not the chat). Keeping the
 // card template inside this client — rather than the dispatcher —

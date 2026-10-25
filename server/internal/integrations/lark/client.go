@@ -198,12 +198,22 @@ type CardStreamingClient interface {
 	// (false settles the card — the typewriter stops and the card becomes a
 	// normal message). Sequence must strictly increase per card operation.
 	SetCardStreamingMode(ctx context.Context, p SetCardStreamingModeParams) error
+
+	// UpdateCardEntity replaces the card's whole JSON document in place
+	// (PUT /cardkit/v1/cards/{card_id}); the delivered message re-renders in
+	// the new layout instantly, with no typewriter animation. Streaming
+	// replies use it for the two structural transitions element updates
+	// cannot express: installing the split think/reply layout when reasoning
+	// appears on a live single-element card, and settling on the answer-only
+	// card at finalize (dropping the thinking box and divider). Sequence must
+	// strictly increase per card operation.
+	UpdateCardEntity(ctx context.Context, p UpdateCardEntityParams) error
 }
 
 // CreateCardEntityParams is the input shape for creating a cardkit card
 // entity. CardJSON is the full schema-2.0 card document; the streaming
-// replier builds it with streaming_mode on and one markdown element whose
-// element_id later addresses the typewriter updates.
+// replier builds it with streaming_mode on and one or two markdown elements
+// whose element_ids later address the typewriter updates.
 type CreateCardEntityParams struct {
 	InstallationID InstallationCredentials
 	CardJSON       string
@@ -233,6 +243,17 @@ type SetCardStreamingModeParams struct {
 	InstallationID InstallationCredentials
 	CardID         string
 	StreamingMode  bool
+	Sequence       int32
+}
+
+// UpdateCardEntityParams replaces a card entity's whole JSON document.
+// CardJSON is the full schema-2.0 card; UUID is an idempotency key Lark
+// deduplicates on.
+type UpdateCardEntityParams struct {
+	InstallationID InstallationCredentials
+	CardID         string
+	CardJSON       string
+	UUID           string
 	Sequence       int32
 }
 

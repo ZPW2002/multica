@@ -535,6 +535,57 @@ func assertCardContentHasUpdateMulti(t *testing.T, content string) {
 	}
 }
 
+// TestHTTPClient_UpdateCardEntity_NestedCardBody pins the wire shape of the
+// whole-card update: unlike creation (flat type/data at the top level), the
+// update nests them under a "card" object. The flat shape fails with 99992402
+// "card is required" — a production incident this contract pin exists to
+// keep from recurring.
+func TestHTTPClient_UpdateCardEntity_NestedCardBody(t *testing.T) {
+	fake := newLarkFake(t)
+	fake.stubToken("tok_up", 7200)
+	fake.mux.HandleFunc("/open-apis/cardkit/v1/cards/card_7", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("update card: want PUT, got %s", r.Method)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("update card: decode: %v", err)
+		}
+		card, ok := body["card"].(map[string]any)
+		if !ok {
+			t.Fatalf("update card: type/data must nest under \"card\", got %v", body)
+		}
+		if card["type"] != "card_json" {
+			t.Errorf("card.type: got %v", card["type"])
+		}
+		data, _ := card["data"].(string)
+		if !strings.Contains(data, `"schema":"2.0"`) {
+			t.Errorf("card.data should carry the card document, got %q", data)
+		}
+		if _, flat := body["type"]; flat {
+			t.Errorf("top-level type/data is the create shape; Lark rejects it here (99992402): %v", body)
+		}
+		if seq, _ := body["sequence"].(float64); seq != 8 {
+			t.Errorf("sequence: got %v want 8", body["sequence"])
+		}
+		if body["uuid"] == "" || body["uuid"] == nil {
+			t.Errorf("uuid (idempotency key) required: %v", body)
+		}
+		writeJSON(w, map[string]any{"code": 0, "msg": "success", "data": map[string]any{}})
+	})
+
+	c := newTestClient(fake, time.Now)
+	if err := c.UpdateCardEntity(context.Background(), UpdateCardEntityParams{
+		InstallationID: testCreds(),
+		CardID:         "card_7",
+		CardJSON:       `{"schema":"2.0","body":{"elements":[]}}`,
+		UUID:           "u-1",
+		Sequence:       8,
+	}); err != nil {
+		t.Fatalf("update card entity: %v", err)
+	}
+}
+
 func TestHTTPClient_SendInteractiveCard_HappyPath(t *testing.T) {
 	fake := newLarkFake(t)
 	fake.stubToken("tok_1", 7200)
