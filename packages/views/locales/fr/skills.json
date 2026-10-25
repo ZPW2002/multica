@@ -315,7 +315,33 @@
       "name_conflict_hint": " Le nom du skill importé existe déjà — supprimez l'existant avant de réessayer.",
       "fallback_error": "Échec de l'importation",
       "cancel": "Annuler",
-      "toast_imported": "Skill importé"
+      "toast_imported": "Skill importé",
+      "github_directory_hint": "Une URL pointant vers un répertoire de skills importe tous les skills qu'il contient dans un groupe étiqueté."
+    },
+    "directory": {
+      "source_label": "Source",
+      "label_label": "Étiquette de groupe",
+      "label_placeholder": "Nom du groupe",
+      "label_hint": "Chaque skill importé reçoit cette étiquette, ce qui permet de filtrer dans la bibliothèque et le sélecteur d'agent.",
+      "skills_label_one": "{{count}} skill trouvé",
+      "skills_label_other": "{{count}} skills trouvés",
+      "conflict_badge": "Nom existant",
+      "on_conflict_label": "Quand un skill du même nom existe",
+      "on_conflict_skip": "L'ignorer",
+      "on_conflict_rename": "Importer une copie renommée",
+      "on_conflict_overwrite": "Écraser le skill existant",
+      "on_conflict_fail": "Marquer ce skill en échec",
+      "conflict_hint_one": "{{count}} skill sélectionné existe déjà dans l'espace de travail.",
+      "conflict_hint_other": "{{count}} skills sélectionnés existent déjà dans l'espace de travail.",
+      "back": "Retour",
+      "import_one": "Importer {{count}} skill",
+      "import_other": "Importer {{count}} skills",
+      "importing_one": "Import de {{count}} skill…",
+      "importing_other": "Import de {{count}} skills…",
+      "fallback_error": "Échec de l'import",
+      "toast_imported_one": "{{count}} skill importé ({{skipped}} ignoré)",
+      "toast_imported_other": "{{count}} skills importés ({{skipped}} ignorés)",
+      "toast_partial": "{{created}} réussis, {{failed}} en échec — voir la liste pour les raisons"
     }
   },
   "runtime_import": {

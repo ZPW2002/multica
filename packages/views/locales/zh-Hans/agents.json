@@ -754,7 +754,10 @@
       "add_dialog_confirm_default": "添加",
       "add_dialog_confirm_other": "添加 {{count}} 个 skill",
       "add_dialog_cancel": "取消",
-      "add_failed_toast": "添加 skill 失败"
+      "add_failed_toast": "添加 skill 失败",
+      "add_dialog_label_filter": "按标签筛选",
+      "add_dialog_label_all": "全部标签",
+      "add_dialog_select_group_other": "全部添加（{{count}}）"
     },
     "integrations": {
       "members_note": "只有工作区的所有者和管理员可以管理此连接。你可以在\"设置 → 集成\"中查看已连接的 Bot。"

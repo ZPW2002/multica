@@ -597,7 +597,10 @@
       "add_dialog_confirm_default": "追加",
       "add_dialog_confirm_other": "スキル {{count}} 件を追加",
       "add_dialog_cancel": "キャンセル",
-      "add_failed_toast": "スキルを追加できませんでした"
+      "add_failed_toast": "スキルを追加できませんでした",
+      "add_dialog_label_filter": "ラベルで絞り込み",
+      "add_dialog_label_all": "すべてのラベル",
+      "add_dialog_select_group_other": "すべて追加（{{count}}）"
     },
     "integrations": {
       "members_note": "この接続を管理できるのはワークスペースのオーナーと管理者のみです。接続済みの Bot は「設定 → 連携」で確認できます。"

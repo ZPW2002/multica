@@ -149,9 +149,10 @@ func init() {
 	skillDeleteCmd.Flags().Bool("yes", false, "Skip confirmation prompt")
 
 	// skill import
-	skillImportCmd.Flags().String("url", "", "URL to import from (clawhub.ai, skills.sh, or github.com). Mutually exclusive with --file.")
+	skillImportCmd.Flags().String("url", "", "URL to import from (clawhub.ai, skills.sh, or github.com). A github.com URL pointing at a directory imports every skill inside it as one group. Mutually exclusive with --file.")
 	skillImportCmd.Flags().String("file", "", "Path to a local skill archive (.skill or .zip) to import. Mutually exclusive with --url.")
 	skillImportCmd.Flags().String("on-conflict", "fail", "Conflict strategy when a skill with the same name exists: fail, overwrite, rename, or skip")
+	skillImportCmd.Flags().String("label", "", "Group label for a github.com directory import (defaults to the repository name)")
 	skillImportCmd.Flags().String("output", "json", "Output format: table or json")
 
 	// skill refresh
@@ -511,6 +512,20 @@ func runSkillImport(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("--on-conflict must be one of: fail, overwrite, rename, skip")
 	}
 
+	if importURL != "" && strings.Contains(importURL, "github.com") {
+		// GitHub URLs may point at a directory of skills. Probe the preview
+		// endpoint first; a directory fans out into a batch import, anything
+		// else (including preview failures on bad URLs) falls through to the
+		// single-skill import, which reports the real error.
+		previewCtx, previewCancel := context.WithTimeout(context.Background(), cli.AtLeastAPITimeout(60*time.Second))
+		var preview map[string]any
+		previewErr := client.PostJSON(previewCtx, "/api/skills/import/preview", map[string]any{"url": importURL}, &preview)
+		previewCancel()
+		if previewErr == nil && strVal(preview, "kind") == "directory" {
+			return runSkillDirectoryImport(cmd, client, importURL, onConflict)
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cli.AtLeastAPITimeout(60*time.Second))
 	defer cancel()
 
@@ -541,6 +556,74 @@ func runSkillImport(cmd *cobra.Command, _ []string) error {
 	}
 
 	return printSkillImportResult(cmd, result)
+}
+
+// runSkillDirectoryImport imports every skill under a GitHub directory in one
+// batch, attaching them to a shared group label.
+func runSkillDirectoryImport(cmd *cobra.Command, client *cli.APIClient, importURL, onConflict string) error {
+	label, _ := cmd.Flags().GetString("label")
+	body := map[string]any{
+		"url":         importURL,
+		"on_conflict": onConflict,
+	}
+	if label != "" {
+		body["label"] = label
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cli.AtLeastAPITimeout(5*time.Minute))
+	defer cancel()
+
+	var result struct {
+		Label *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"label"`
+		Results []struct {
+			Dir     string `json:"dir"`
+			Name    string `json:"name"`
+			Status  string `json:"status"`
+			Reason  string `json:"reason"`
+			SkillID string `json:"skill_id"`
+		} `json:"results"`
+	}
+	if err := client.PostJSON(ctx, "/api/skills/import/batch", body, &result); err != nil {
+		if handledErr := handleSkillImportError(cmd, err); handledErr != nil {
+			return handledErr
+		}
+		return fmt.Errorf("import skill directory: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, result)
+	}
+
+	created, updated, skipped, failed := 0, 0, 0, 0
+	for _, item := range result.Results {
+		switch item.Status {
+		case "created":
+			created++
+			fmt.Printf("created  %s (%s)\n", item.Name, item.SkillID)
+		case "updated":
+			updated++
+			fmt.Printf("updated  %s (%s)\n", item.Name, item.SkillID)
+		case "skipped":
+			skipped++
+			fmt.Printf("skipped  %s — %s\n", item.Name, item.Reason)
+		default:
+			failed++
+			fmt.Printf("failed   %s — %s\n", item.Dir, item.Reason)
+		}
+	}
+	summary := fmt.Sprintf("%d created, %d updated, %d skipped, %d failed", created, updated, skipped, failed)
+	if result.Label != nil {
+		summary += fmt.Sprintf(" — group label: %s (%s)", result.Label.Name, result.Label.ID)
+	}
+	fmt.Println(summary)
+	if failed > 0 {
+		return errors.New("some skills failed to import")
+	}
+	return nil
 }
 
 func validSkillImportConflictStrategy(strategy string) bool {

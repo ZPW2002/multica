@@ -772,7 +772,11 @@
       "add_dialog_confirm_one": "Add {{count}} skill",
       "add_dialog_confirm_other": "Add {{count}} skills",
       "add_dialog_cancel": "Cancel",
-      "add_failed_toast": "Failed to add skill"
+      "add_failed_toast": "Failed to add skill",
+      "add_dialog_label_filter": "Filter by label",
+      "add_dialog_label_all": "All labels",
+      "add_dialog_select_group_one": "Add all ({{count}})",
+      "add_dialog_select_group_other": "Add all ({{count}})"
     },
     "integrations": {
       "members_note": "Only workspace owners and admins can manage this connection. You can view connected bots in Settings → Integrations."

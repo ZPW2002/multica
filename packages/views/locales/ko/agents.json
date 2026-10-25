@@ -605,7 +605,10 @@
       "add_dialog_confirm_default": "추가",
       "add_dialog_confirm_other": "스킬 {{count}}개 추가",
       "add_dialog_cancel": "취소",
-      "add_failed_toast": "스킬을 추가하지 못했습니다"
+      "add_failed_toast": "스킬을 추가하지 못했습니다",
+      "add_dialog_label_filter": "라벨로 필터",
+      "add_dialog_label_all": "모든 라벨",
+      "add_dialog_select_group_other": "모두 추가({{count}})"
     },
     "integrations": {
       "members_note": "이 연결을 관리할 수 있는 사람은 워크스페이스 소유자와 관리자뿐입니다. 연결된 봇은 설정 → 연동에서 확인할 수 있습니다."

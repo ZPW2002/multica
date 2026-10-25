@@ -299,7 +299,28 @@
       "name_conflict_hint": "导入的 skill 名称已存在——请先删除已有的再重试。",
       "fallback_error": "导入失败",
       "cancel": "取消",
-      "toast_imported": "已导入 skill"
+      "toast_imported": "已导入 skill",
+      "github_directory_hint": "指向技能目录的链接会一次性导入目录下的所有技能，并自动归入同一分组标签。"
+    },
+    "directory": {
+      "source_label": "来源",
+      "label_label": "分组标签",
+      "label_placeholder": "分组名称",
+      "label_hint": "导入的技能都会带上这个标签，技能库和智能体分配时都可以按它筛选。",
+      "skills_label_other": "找到 {{count}} 个技能",
+      "conflict_badge": "同名已存在",
+      "on_conflict_label": "同名技能已存在时",
+      "on_conflict_skip": "跳过",
+      "on_conflict_rename": "导入并自动改名",
+      "on_conflict_overwrite": "覆盖已有技能",
+      "on_conflict_fail": "该技能记为失败",
+      "conflict_hint_other": "所选技能中有 {{count}} 个在工作区已存在。",
+      "back": "返回",
+      "import_other": "导入 {{count}} 个技能",
+      "importing_other": "正在导入 {{count}} 个技能…",
+      "fallback_error": "导入失败",
+      "toast_imported_other": "已导入 {{count}} 个技能（跳过 {{skipped}} 个）",
+      "toast_partial": "成功 {{created}} 个，失败 {{failed}} 个，原因见列表"
     }
   },
   "runtime_import": {

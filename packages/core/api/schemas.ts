@@ -88,6 +88,8 @@ import type {
   Skill,
   SkillImportResult,
   SkillSummary,
+  SkillDirectoryPreview,
+  SkillDirectoryImportResult,
   Squad,
   TimelineEntry,
   User,
@@ -3566,6 +3568,55 @@ export const EMPTY_SKILL: Skill = {
 export const SkillSummaryListSchema = z.array(SkillSummarySchema).default([]);
 
 export const EMPTY_SKILL_SUMMARY_LIST: SkillSummary[] = [];
+
+// Directory imports: preview enumerates every skill under a GitHub directory;
+// batch imports the selected ones under one shared group label.
+export const SkillDirectorySkillPreviewSchema = z.object({
+  dir: z.string(),
+  name: z.string(),
+  description: z.string().optional().default(""),
+  conflict: z.boolean().optional().default(false),
+}).loose();
+
+export const SkillDirectoryPreviewSchema = z.object({
+  // "directory" | "single" — single means the client falls back to the plain
+  // single-skill import.
+  kind: z.string().optional().default("directory"),
+  owner: z.string().optional().default(""),
+  repo: z.string().optional().default(""),
+  ref: z.string().optional().default(""),
+  dir: z.string().optional().default(""),
+  label: z.string().optional().default(""),
+  skills: z.array(SkillDirectorySkillPreviewSchema).optional().default([]),
+}).loose();
+
+export const EMPTY_SKILL_DIRECTORY_PREVIEW: SkillDirectoryPreview = {
+  kind: "directory",
+  owner: "",
+  repo: "",
+  ref: "",
+  dir: "",
+  label: "",
+  skills: [],
+};
+
+export const SkillDirectoryImportItemSchema = z.object({
+  dir: z.string(),
+  name: z.string(),
+  status: z.string().optional().default("failed"),
+  reason: z.string().optional().default(""),
+  skill_id: z.string().optional().default(""),
+}).loose();
+
+export const SkillDirectoryImportResultSchema = z.object({
+  label: LabelSchema.nullable().catch(null),
+  results: z.array(SkillDirectoryImportItemSchema).optional().default([]),
+}).loose();
+
+export const EMPTY_SKILL_DIRECTORY_IMPORT_RESULT: SkillDirectoryImportResult = {
+  label: null,
+  results: [],
+};
 
 export const SkillImportExistingSkillSchema = z.object({
   id: z.string(),

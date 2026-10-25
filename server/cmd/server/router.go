@@ -2342,6 +2342,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Post("/", h.CreateSkill)
 				r.Get("/search", h.SearchSkills)
 				r.Post("/import", h.ImportSkill)
+				// Directory imports: enumerate a multi-skill directory
+				// (preview) then import the selected children as one batch
+				// with a shared group label.
+				r.Post("/import/preview", h.PreviewSkillDirectoryImport)
+				r.Post("/import/batch", h.ImportSkillDirectory)
 				r.Route("/{id}", func(r chi.Router) {
 					r.Get("/", h.GetSkill)
 					r.Put("/", h.UpdateSkill)

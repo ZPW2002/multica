@@ -17,7 +17,7 @@ import {
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "@multica/core/api";
-import type { Skill } from "@multica/core/types";
+import type { Skill, SkillDirectoryPreview } from "@multica/core/types";
 import {
   prepareSkillArchiveFromPickerFiles,
   wrapExistingSkillArchive,
@@ -29,6 +29,7 @@ import {
   skillDetailOptions,
   workspaceKeys,
 } from "@multica/core/workspace/queries";
+import { labelKeys } from "@multica/core/labels/queries";
 import {
   Dialog,
   DialogContent,
@@ -40,9 +41,18 @@ import {
   TooltipTrigger,
 } from "@multica/ui/components/ui/tooltip";
 import { Button } from "@multica/ui/components/ui/button";
+import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
 import { Textarea } from "@multica/ui/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@multica/ui/components/ui/select";
+import { Badge } from "@multica/ui/components/ui/badge";
 import { useScrollFade } from "@multica/ui/hooks/use-scroll-fade";
 import { cn } from "@multica/ui/lib/utils";
 import { openExternal } from "../../platform";
@@ -249,41 +259,266 @@ function detectUrlSource(url: string): DetectedSource {
   return null;
 }
 
-function SourceCard({
-  label,
-  exampleHost,
-  browseUrl,
-  active,
+type DirectoryOnConflict = "skip" | "rename" | "overwrite" | "fail";
+
+// Directory preview body: one row per enumerated skill, a shared group
+// label, and the on-conflict strategy applied to every import.
+function DirectoryPanel({
+  preview,
+  url,
+  onDone,
+  onBack,
 }: {
-  label: string;
-  exampleHost: string;
-  browseUrl: string;
-  active: boolean;
+  preview: SkillDirectoryPreview;
+  url: string;
+  onDone: () => void;
+  onBack: () => void;
 }) {
+  const { t } = useT("skills");
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(preview.skills.map((s) => s.dir)),
+  );
+  const [label, setLabel] = useState(preview.label);
+  const [onConflict, setOnConflict] = useState<DirectoryOnConflict>("skip");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fadeStyle = useScrollFade(scrollRef);
+
+  const conflictCount = preview.skills.filter(
+    (s) => s.conflict && selected.has(s.dir),
+  ).length;
+
+  const toggle = (dir: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(dir)) next.delete(dir);
+      else next.add(dir);
+      return next;
+    });
+  };
+
+  const submit = async () => {
+    if (selected.size === 0) return;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api.importSkillDirectory({
+        url,
+        dirs: [...selected],
+        label,
+        on_conflict: onConflict,
+      });
+      const created = result.results.filter((r) => r.status === "created").length;
+      const updated = result.results.filter((r) => r.status === "updated").length;
+      const skipped = result.results.filter((r) => r.status === "skipped").length;
+      const failed = result.results.filter((r) => r.status === "failed");
+      qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId) });
+      qc.invalidateQueries({ queryKey: labelKeys.list(wsId, "skill") });
+      qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
+      if (failed.length > 0) {
+        toast.error(
+          t(($) => $.create.directory.toast_partial, {
+            created,
+            failed: failed.length,
+          }),
+        );
+      } else {
+        toast.success(
+          t(($) => $.create.directory.toast_imported, {
+            count: created + updated,
+            skipped,
+          }),
+        );
+      }
+      onDone();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : t(($) => $.create.directory.fallback_error),
+      );
+      setLoading(false);
+    }
+  };
+
   return (
-    <div
-      className={`rounded-md border px-3 py-2.5 transition-colors ${
-        active ? "border-primary bg-primary/5" : ""
-      }`}
-    >
-      <div className="text-caption font-medium">{label}</div>
-      <button
-        type="button"
-        onClick={() => openExternal(browseUrl)}
-        className="mt-0.5 block max-w-full truncate text-left font-mono text-caption text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+    <>
+      <div
+        ref={scrollRef}
+        style={fadeStyle}
+        className="flex-1 min-h-0 space-y-4 overflow-y-auto px-5 py-4"
       >
-        {exampleHost}
-      </button>
-    </div>
+        <div className="rounded-md border px-3 py-2.5">
+          <div className="text-caption text-muted-foreground">
+            {t(($) => $.create.directory.source_label)}
+          </div>
+          <div className="mt-0.5 truncate font-mono text-caption">
+            {preview.owner}/{preview.repo}
+            {preview.dir ? `/${preview.dir}` : ""}
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label
+            htmlFor="directory-label"
+            className="text-caption text-muted-foreground"
+          >
+            {t(($) => $.create.directory.label_label)}
+          </Label>
+          <Input
+            id="directory-label"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder={t(($) => $.create.directory.label_placeholder)}
+            className="text-body"
+          />
+          <p className="text-caption text-muted-foreground">
+            {t(($) => $.create.directory.label_hint)}
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="text-caption text-muted-foreground">
+            {t(($) => $.create.directory.skills_label, {
+              count: preview.skills.length,
+            })}
+          </div>
+          <div className="space-y-1">
+            {preview.skills.map((skill) => (
+              <label
+                key={skill.dir}
+                className={cn(
+                  "flex cursor-pointer items-start gap-2.5 rounded-md border px-3 py-2 transition-colors",
+                  selected.has(skill.dir)
+                    ? "border-primary/50 bg-primary/5"
+                    : "hover:border-primary/30",
+                )}
+              >
+                <Checkbox
+                  checked={selected.has(skill.dir)}
+                  onCheckedChange={() => toggle(skill.dir)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="mt-0.5"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-2">
+                    <span className="truncate text-body font-medium">
+                      {skill.name}
+                    </span>
+                    {skill.conflict && (
+                      <Badge variant="outline" className="shrink-0 text-caption">
+                        {t(($) => $.create.directory.conflict_badge)}
+                      </Badge>
+                    )}
+                  </span>
+                  {skill.description ? (
+                    <span className="mt-0.5 block truncate text-caption text-muted-foreground">
+                      {skill.description}
+                    </span>
+                  ) : null}
+                  <span className="mt-0.5 block truncate font-mono text-caption text-faint-foreground">
+                    {skill.dir}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label
+            htmlFor="directory-on-conflict"
+            className="text-caption text-muted-foreground"
+          >
+            {t(($) => $.create.directory.on_conflict_label)}
+          </Label>
+          <Select
+            value={onConflict}
+            onValueChange={(v) => v && setOnConflict(v as DirectoryOnConflict)}
+            items={[
+              { value: "skip", label: t(($) => $.create.directory.on_conflict_skip) },
+              { value: "rename", label: t(($) => $.create.directory.on_conflict_rename) },
+              { value: "overwrite", label: t(($) => $.create.directory.on_conflict_overwrite) },
+              { value: "fail", label: t(($) => $.create.directory.on_conflict_fail) },
+            ]}
+          >
+            <SelectTrigger id="directory-on-conflict" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="skip">
+                {t(($) => $.create.directory.on_conflict_skip)}
+              </SelectItem>
+              <SelectItem value="rename">
+                {t(($) => $.create.directory.on_conflict_rename)}
+              </SelectItem>
+              <SelectItem value="overwrite">
+                {t(($) => $.create.directory.on_conflict_overwrite)}
+              </SelectItem>
+              <SelectItem value="fail">
+                {t(($) => $.create.directory.on_conflict_fail)}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          {conflictCount > 0 && (
+            <p className="text-caption text-muted-foreground">
+              {t(($) => $.create.directory.conflict_hint, {
+                count: conflictCount,
+              })}
+            </p>
+          )}
+        </div>
+
+        {error && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-md bg-destructive/10 px-3 py-2 text-caption text-destructive"
+          >
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="flex shrink-0 items-center justify-between gap-2 border-t bg-muted/30 px-5 py-3">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onBack}
+          disabled={loading}
+        >
+          {t(($) => $.create.directory.back)}
+        </Button>
+        <Button type="button" size="sm" onClick={submit} disabled={selected.size === 0 || loading}>
+          {loading ? (
+            <>
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {t(($) => $.create.directory.importing, { count: selected.size })}
+            </>
+          ) : (
+            <>
+              <Download className="h-3 w-3" />
+              {t(($) => $.create.directory.import, { count: selected.size })}
+            </>
+          )}
+        </Button>
+      </div>
+    </>
   );
 }
 
 function UrlForm({
   onCreated,
   onCancel,
+  onClose,
 }: {
   onCreated: (skill: Skill) => void;
   onCancel: () => void;
+  onClose: () => void;
 }) {
   const { t } = useT("skills");
   const qc = useQueryClient();
@@ -291,6 +526,7 @@ function UrlForm({
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [directory, setDirectory] = useState<SkillDirectoryPreview | null>(null);
   const source = detectUrlSource(url);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fadeStyle = useScrollFade(scrollRef);
@@ -301,6 +537,22 @@ function UrlForm({
     setLoading(true);
     setError("");
     try {
+      // GitHub URLs may point at a directory of skills — probe first and
+      // switch to the batch panel when they do. Everything else (including
+      // a single-skill GitHub URL) goes through the plain import.
+      if (source === "github") {
+        try {
+          const preview = await api.previewSkillDirectoryImport(trimmed);
+          if (preview.kind === "directory") {
+            setDirectory(preview);
+            setLoading(false);
+            return;
+          }
+        } catch {
+          // Fall through to the single import below; it reports the real
+          // upstream error for URLs the preview cannot make sense of.
+        }
+      }
       const skill = await api.importSkill({ url: trimmed });
       seedAfterCreate(qc, wsId, skill);
       toast.success(t(($) => $.create.url.toast_imported));
@@ -310,6 +562,20 @@ function UrlForm({
       setLoading(false);
     }
   };
+
+  if (directory) {
+    return (
+      <DirectoryPanel
+        preview={directory}
+        url={url.trim()}
+        onDone={onClose}
+        onBack={() => {
+          setDirectory(null);
+          setError("");
+        }}
+      />
+    );
+  }
 
   const submittingLabel = (() => {
     if (!loading) return t(($) => $.create.url.import);
@@ -344,6 +610,11 @@ function UrlForm({
               if (e.key === "Enter") submit();
             }}
           />
+          {source === "github" && (
+            <p className="text-caption text-muted-foreground">
+              {t(($) => $.create.url.github_directory_hint)}
+            </p>
+          )}
         </div>
 
         <div>
@@ -418,6 +689,35 @@ function UrlForm({
         </Button>
       </div>
     </>
+  );
+}
+
+function SourceCard({
+  label,
+  exampleHost,
+  browseUrl,
+  active,
+}: {
+  label: string;
+  exampleHost: string;
+  browseUrl: string;
+  active: boolean;
+}) {
+  return (
+    <div
+      className={`rounded-md border px-3 py-2.5 transition-colors ${
+        active ? "border-primary bg-primary/5" : ""
+      }`}
+    >
+      <div className="text-caption font-medium">{label}</div>
+      <button
+        type="button"
+        onClick={() => openExternal(browseUrl)}
+        className="mt-0.5 block max-w-full truncate text-left font-mono text-caption text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+      >
+        {exampleHost}
+      </button>
+    </div>
   );
 }
 
@@ -805,6 +1105,7 @@ export function CreateSkillDialog({
           <UrlForm
             onCreated={handleCreated}
             onCancel={() => setMethod("chooser")}
+            onClose={onClose}
           />
         )}
         {method === "runtime" && (

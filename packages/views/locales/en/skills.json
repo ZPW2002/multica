@@ -315,7 +315,33 @@
       "name_conflict_hint": " The imported skill's name already exists — delete the existing one before retrying.",
       "fallback_error": "Import failed",
       "cancel": "Cancel",
-      "toast_imported": "Skill imported"
+      "toast_imported": "Skill imported",
+      "github_directory_hint": "A URL pointing at a directory of skills imports every skill inside it as one labeled group."
+    },
+    "directory": {
+      "source_label": "Source",
+      "label_label": "Group label",
+      "label_placeholder": "Group name",
+      "label_hint": "Every imported skill gets this label, so the library and the agent picker can filter by it.",
+      "skills_label_one": "{{count}} skill found",
+      "skills_label_other": "{{count}} skills found",
+      "conflict_badge": "Name exists",
+      "on_conflict_label": "When a skill with the same name exists",
+      "on_conflict_skip": "Skip it",
+      "on_conflict_rename": "Import a renamed copy",
+      "on_conflict_overwrite": "Overwrite the existing skill",
+      "on_conflict_fail": "Fail that skill",
+      "conflict_hint_one": "{{count}} selected skill already exists in this workspace.",
+      "conflict_hint_other": "{{count}} selected skills already exist in this workspace.",
+      "back": "Back",
+      "import_one": "Import {{count}} skill",
+      "import_other": "Import {{count}} skills",
+      "importing_one": "Importing {{count}} skill…",
+      "importing_other": "Importing {{count}} skills…",
+      "fallback_error": "Import failed",
+      "toast_imported_one": "Imported {{count}} skill ({{skipped}} skipped)",
+      "toast_imported_other": "Imported {{count}} skills ({{skipped}} skipped)",
+      "toast_partial": "Imported {{created}}, failed {{failed}} — see the list for reasons"
     }
   },
   "runtime_import": {

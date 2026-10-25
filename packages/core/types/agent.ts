@@ -856,6 +856,42 @@ export interface UpdateAgentEnvRequest {
 
 // Skills
 
+/** One enumerated skill under a GitHub directory-import preview. */
+export interface SkillDirectorySkillPreview {
+  dir: string;
+  name: string;
+  description: string;
+  conflict: boolean;
+}
+
+/**
+ * `POST /api/skills/import/preview` response. `kind: "single"` means the URL
+ * points at one skill and the client should use the regular import instead.
+ */
+export interface SkillDirectoryPreview {
+  kind: "directory" | "single" | string;
+  owner: string;
+  repo: string;
+  ref: string;
+  dir: string;
+  label: string;
+  skills: SkillDirectorySkillPreview[];
+}
+
+/** Per-skill outcome of `POST /api/skills/import/batch`. */
+export interface SkillDirectoryImportItem {
+  dir: string;
+  name: string;
+  status: string;
+  reason: string;
+  skill_id: string;
+}
+
+export interface SkillDirectoryImportResult {
+  label: Label | null;
+  results: SkillDirectoryImportItem[];
+}
+
 /**
  * Lightweight skill shape returned by list endpoints (`GET /api/skills`,
  * `GET /api/agents/:id/skills`). The full SKILL.md `content` is intentionally

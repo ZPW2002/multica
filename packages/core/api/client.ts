@@ -68,6 +68,8 @@ import type {
   User,
   Skill,
   SkillSummary,
+  SkillDirectoryPreview,
+  SkillDirectoryImportResult,
   CreateSkillRequest,
   UpdateSkillRequest,
   SetAgentSkillsRequest,
@@ -460,6 +462,10 @@ import {
   EMPTY_SKILL_SUMMARY_LIST,
   SkillImportResultSchema,
   EMPTY_SKILL_IMPORT_RESULT,
+  SkillDirectoryPreviewSchema,
+  EMPTY_SKILL_DIRECTORY_PREVIEW,
+  SkillDirectoryImportResultSchema,
+  EMPTY_SKILL_DIRECTORY_IMPORT_RESULT,
   IssueViewSchema,
   IssueViewListSchema,
   IssueViewPreferenceSchema,
@@ -3564,6 +3570,35 @@ export class ApiClient {
     return this.fetch("/api/skills/import", {
       method: "POST",
       body: JSON.stringify(data),
+    });
+  }
+
+  // Enumerates the skills under a GitHub directory URL. `kind: "single"`
+  // means the URL targets one skill and the caller should use importSkill.
+  async previewSkillDirectoryImport(url: string): Promise<SkillDirectoryPreview> {
+    const raw = await this.fetch<unknown>("/api/skills/import/preview", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
+    return parseWithFallback(raw, SkillDirectoryPreviewSchema, EMPTY_SKILL_DIRECTORY_PREVIEW, {
+      endpoint: "POST /api/skills/import/preview",
+    });
+  }
+
+  // Imports the selected skills of a GitHub directory in one batch, attaching
+  // them to a shared group label.
+  async importSkillDirectory(data: {
+    url: string;
+    dirs?: string[];
+    label?: string;
+    on_conflict?: "fail" | "overwrite" | "rename" | "skip";
+  }): Promise<SkillDirectoryImportResult> {
+    const raw = await this.fetch<unknown>("/api/skills/import/batch", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+    return parseWithFallback(raw, SkillDirectoryImportResultSchema, EMPTY_SKILL_DIRECTORY_IMPORT_RESULT, {
+      endpoint: "POST /api/skills/import/batch",
     });
   }
 

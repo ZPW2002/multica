@@ -1,0 +1,378 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+)
+
+// directoryFixture serves a two-skill repository:
+//
+//	ui-skills/
+//	  SKILL.md            ← root skill (drives the "single" branch)
+//	  README.md
+//	  skills/alpha/SKILL.md          (frontmatter name: alpha-skill)
+//	  skills/alpha/references/notes.md
+//	  skills/beta/SKILL.md           (no frontmatter → name falls back to dir)
+//	  skills/beta/scripts/run.py
+//	  skills/justdocs/readme.md      (no SKILL.md → not a skill)
+func directoryFixture(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("X-Test-Original-Host") {
+		case "api.github.com":
+			switch r.URL.Path {
+			case "/repos/acme/ui-skills":
+				writeJSON(w, http.StatusOK, map[string]any{"default_branch": "main"})
+			case "/repos/acme/ui-skills/commits/main":
+				// Ref probe used to disambiguate /tree/{ref}/{path} URLs.
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("0123456789abcdef"))
+			case "/repos/acme/ui-skills/git/trees/main":
+				writeJSON(w, http.StatusOK, githubTreeResponse{
+					Tree: []githubTreeEntry{
+						{Path: "SKILL.md", Type: "blob"},
+						{Path: "README.md", Type: "blob"},
+						{Path: "skills/alpha/SKILL.md", Type: "blob"},
+						{Path: "skills/alpha/references/notes.md", Type: "blob"},
+						{Path: "skills/beta/SKILL.md", Type: "blob"},
+						{Path: "skills/beta/scripts/run.py", Type: "blob"},
+						{Path: "skills/justdocs/readme.md", Type: "blob"},
+					},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		case "raw.githubusercontent.com":
+			switch r.URL.Path {
+			case "/acme/ui-skills/main/skills/alpha/SKILL.md":
+				w.Write([]byte("---\nname: alpha-skill\ndescription: Alpha preview\n---\nalpha body"))
+			case "/acme/ui-skills/main/skills/alpha/references/notes.md":
+				w.Write([]byte("alpha notes"))
+			case "/acme/ui-skills/main/skills/beta/SKILL.md":
+				w.Write([]byte("beta body"))
+			case "/acme/ui-skills/main/skills/beta/scripts/run.py":
+				w.Write([]byte("print('beta')"))
+			case "/acme/ui-skills/main/SKILL.md":
+				w.Write([]byte("---\nname: root-skill\n---\nroot"))
+			default:
+				http.NotFound(w, r)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}
+}
+
+func withDirectoryFixtureClient(t *testing.T) {
+	t.Helper()
+	prev := importDirectoryHTTPClient
+	client, _ := newGitHubFixtureClient(t, directoryFixture(t))
+	importDirectoryHTTPClient = func() *http.Client { return client }
+	t.Cleanup(func() { importDirectoryHTTPClient = prev })
+}
+
+// insertHandlerTestSkillExact inserts a skill with an exact name (the shared
+// helper derives names from the test name; directory imports collide on
+// upstream skill names instead).
+func insertHandlerTestSkillExact(t *testing.T, name string) {
+	t.Helper()
+	var id string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO skill (workspace_id, name, description, content, config, created_by)
+		VALUES ($1, $2, 'fixture', '# Existing', '{}'::jsonb, $3)
+		RETURNING id
+	`, testWorkspaceID, name, testUserID).Scan(&id); err != nil {
+		t.Fatalf("insert skill %q: %v", name, err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM skill WHERE id = $1`, id)
+	})
+}
+
+// cleanupDirectoryImport removes the skills and group label a directory
+// import test created. Labels have no FK to skill rows, so both sides need
+// explicit deletes.
+func cleanupDirectoryImport(t *testing.T, labelName string, skillNames ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		for _, name := range skillNames {
+			var id string
+			if err := testPool.QueryRow(ctx, `SELECT id FROM skill WHERE workspace_id=$1 AND name=$2`,
+				testWorkspaceID, name).Scan(&id); err == nil {
+				testPool.Exec(ctx, `DELETE FROM skill_to_label WHERE skill_id=$1`, id)
+				testPool.Exec(ctx, `DELETE FROM skill WHERE id=$1`, id)
+			}
+		}
+		testPool.Exec(ctx, `DELETE FROM issue_label WHERE workspace_id=$1 AND name=$2 AND resource_type='skill'`,
+			testWorkspaceID, labelName)
+	})
+}
+
+func testWorkspaceUUID() pgtype.UUID {
+	return parseUUID(testWorkspaceID)
+}
+
+func TestChildSkillDirs(t *testing.T) {
+	tree := []githubTreeEntry{
+		{Path: "SKILL.md", Type: "blob"},
+		{Path: "README.md", Type: "blob"},
+		{Path: "skills/alpha/SKILL.md", Type: "blob"},
+		{Path: "skills/alpha/references/notes.md", Type: "blob"},
+		{Path: "skills/beta/SKILL.md", Type: "blob"},
+		{Path: "skills/justdocs/readme.md", Type: "blob"},
+		{Path: "skills/nested/inner/SKILL.md", Type: "blob"},
+		{Path: "other/gamma/SKILL.md", Type: "blob"},
+		{Path: "toplevel/SKILL.md", Type: "blob"},
+	}
+	got := childSkillDirs(tree, "skills")
+	want := []string{"skills/alpha", "skills/beta"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("childSkillDirs = %v, want %v", got, want)
+	}
+	// Root enumeration only offers skills sitting directly at the repository
+	// root; deeper ones belong to the directory that holds them.
+	root := childSkillDirs(tree, "")
+	if strings.Join(root, ",") != "toplevel" {
+		t.Fatalf("childSkillDirs(root) = %v, want [toplevel]", root)
+	}
+}
+
+func TestSelectDirectoryImportDirs(t *testing.T) {
+	all := []string{"a", "b", "c"}
+	if got := selectDirectoryImportDirs(all, nil); strings.Join(got, "") != "abc" {
+		t.Fatalf("nil selection = %v, want all", got)
+	}
+	// Order follows enumeration, not the request order; unknown dirs drop.
+	got := selectDirectoryImportDirs(all, []string{"c", "nope", "a"})
+	if strings.Join(got, ",") != "a,c" {
+		t.Fatalf("selection = %v", got)
+	}
+	if got := selectDirectoryImportDirs(all, []string{"nope"}); len(got) != 0 {
+		t.Fatalf("unknown selection = %v, want empty", got)
+	}
+}
+
+func TestSuggestedDirectoryLabel(t *testing.T) {
+	if got := suggestedDirectoryLabel("ui-skills"); got != "ui-skills" {
+		t.Fatalf("label = %q", got)
+	}
+	if got := suggestedDirectoryLabel("A-Very-Long-Repository-Name-That-Exceeds-32-Runes"); got != "a-very-long-repository-name-that" {
+		t.Fatalf("truncated label = %q (len %d)", got, len(got))
+	}
+	if got := suggestedDirectoryLabel(""); got != "" {
+		t.Fatalf("empty repo label = %q", got)
+	}
+}
+
+func TestFetchDirectorySkillReusesSharedTree(t *testing.T) {
+	client, _ := newGitHubFixtureClient(t, directoryFixture(t))
+	skill, err := fetchDirectorySkill(context.Background(), client, "https://raw.githubusercontent.com/acme/ui-skills/main",
+		[]githubTreeEntry{
+			{Path: "skills/alpha/SKILL.md", Type: "blob"},
+			{Path: "skills/alpha/references/notes.md", Type: "blob"},
+		}, "skills/alpha", "https://github.com/acme/ui-skills/tree/main/skills", "acme", "ui-skills", "main")
+	if err != nil {
+		t.Fatalf("fetchDirectorySkill: %v", err)
+	}
+	if skill.name != "alpha-skill" || skill.description != "Alpha preview" {
+		t.Fatalf("name/description = %q/%q", skill.name, skill.description)
+	}
+	if !strings.Contains(skill.content, "alpha body") {
+		t.Fatalf("content = %q", skill.content)
+	}
+	if got := importedFilePaths(skill.files); strings.Join(got, ",") != "references/notes.md" {
+		t.Fatalf("files = %v", got)
+	}
+	if skill.origin["path"] != "skills/alpha" || skill.origin["repo"] != "ui-skills" {
+		t.Fatalf("origin = %#v", skill.origin)
+	}
+}
+
+func TestPreviewSkillDirectoryReportsConflicts(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	insertHandlerTestSkillExact(t, "alpha-skill")
+	withDirectoryFixtureClient(t)
+
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/preview", map[string]any{
+		"url": "https://github.com/acme/ui-skills/tree/main/skills",
+	})
+	testHandler.PreviewSkillDirectoryImport(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body SkillDirectoryPreviewResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Kind != "directory" || body.Repo != "ui-skills" || body.Label != "ui-skills" {
+		t.Fatalf("body head = %#v", body)
+	}
+	if len(body.Skills) != 2 {
+		t.Fatalf("skills = %#v", body.Skills)
+	}
+	first := body.Skills[0]
+	if first.Dir != "skills/alpha" || first.Name != "alpha-skill" || first.Description != "Alpha preview" {
+		t.Fatalf("first = %#v", first)
+	}
+	if !first.Conflict {
+		t.Fatalf("alpha-skill should be marked conflicting, got %#v", first)
+	}
+	if body.Skills[1].Conflict {
+		t.Fatalf("beta should not conflict, got %#v", body.Skills[1])
+	}
+}
+
+func TestPreviewSkillDirectorySingleSkillFallsBack(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	withDirectoryFixtureClient(t)
+
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/preview", map[string]any{
+		"url": "https://github.com/acme/ui-skills/tree/main",
+	})
+	testHandler.PreviewSkillDirectoryImport(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body SkillDirectoryPreviewResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Kind != "single" {
+		t.Fatalf("kind = %q, want single", body.Kind)
+	}
+}
+
+func TestPreviewSkillDirectoryRejectsNonGitHub(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/preview", map[string]any{
+		"url": "https://clawhub.ai/acme/some-skill",
+	})
+	testHandler.PreviewSkillDirectoryImport(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", w.Code)
+	}
+}
+
+func TestImportSkillDirectoryCreatesSkillsAndGroupLabel(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	cleanupDirectoryImport(t, "ui-skills", "alpha-skill", "beta")
+	withDirectoryFixtureClient(t)
+
+	// No label in the request: the repository-name default applies.
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/batch", map[string]any{
+		"url":         "https://github.com/acme/ui-skills/tree/main/skills",
+		"dirs":        []string{"skills/alpha"},
+		"on_conflict": "skip",
+	})
+	testHandler.ImportSkillDirectory(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body SkillDirectoryImportResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Label == nil || body.Label.Name != "ui-skills" || body.Label.ResourceType != "skill" {
+		t.Fatalf("label = %#v", body.Label)
+	}
+	if len(body.Results) != 1 {
+		t.Fatalf("results = %#v", body.Results)
+	}
+	item := body.Results[0]
+	if item.Status != "created" || item.Name != "alpha-skill" || item.SkillID == "" {
+		t.Fatalf("item = %#v", item)
+	}
+
+	skill, found, err := testHandler.lookupSkillByName(context.Background(), testWorkspaceUUID(), "alpha-skill")
+	if err != nil || !found {
+		t.Fatalf("lookup imported skill: found=%v err=%v", found, err)
+	}
+	labels, err := testHandler.Queries.ListLabelsBySkill(context.Background(), db.ListLabelsBySkillParams{
+		SkillID: skill.ID, WorkspaceID: testWorkspaceUUID(),
+	})
+	if err != nil {
+		t.Fatalf("list skill labels: %v", err)
+	}
+	if len(labels) != 1 || labels[0].Name != "ui-skills" {
+		t.Fatalf("labels = %#v", labels)
+	}
+}
+
+func TestImportSkillDirectorySkipsExistingAndKeepsGoing(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	// beta has no frontmatter name, so the import names it after its directory.
+	insertHandlerTestSkillExact(t, "beta")
+	cleanupDirectoryImport(t, "dir-import-group", "alpha-skill", "beta")
+	withDirectoryFixtureClient(t)
+
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/batch", map[string]any{
+		"url":         "https://github.com/acme/ui-skills/tree/main/skills",
+		"on_conflict": "skip",
+		"label":       "dir-import-group",
+	})
+	testHandler.ImportSkillDirectory(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body SkillDirectoryImportResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Results) != 2 {
+		t.Fatalf("results = %#v", body.Results)
+	}
+	byDir := map[string]SkillDirectoryImportItem{}
+	for _, item := range body.Results {
+		byDir[item.Dir] = item
+	}
+	if byDir["skills/alpha"].Status != "created" {
+		t.Fatalf("alpha = %#v", byDir["skills/alpha"])
+	}
+	if byDir["skills/beta"].Status != "skipped" {
+		t.Fatalf("beta = %#v", byDir["skills/beta"])
+	}
+	if body.Label == nil || body.Label.Name != "dir-import-group" {
+		t.Fatalf("label = %#v", body.Label)
+	}
+}
+
+func TestImportSkillDirectoryRejectsSingleSkillURL(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	withDirectoryFixtureClient(t)
+
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/batch", map[string]any{
+		"url":         "https://github.com/acme/ui-skills/tree/main",
+		"on_conflict": "skip",
+	})
+	testHandler.ImportSkillDirectory(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+}

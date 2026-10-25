@@ -299,7 +299,28 @@
       "name_conflict_hint": " インポートしたスキル名はすでに存在します。再試行する前に既存のものを削除してください。",
       "fallback_error": "インポートに失敗しました",
       "cancel": "キャンセル",
-      "toast_imported": "スキルをインポートしました"
+      "toast_imported": "スキルをインポートしました",
+      "github_directory_hint": "スキルディレクトリへの URL を指定すると、配下のすべてのスキルをひとつのグループラベル付きで一括インポートします。"
+    },
+    "directory": {
+      "source_label": "ソース",
+      "label_label": "グループラベル",
+      "label_placeholder": "グループ名",
+      "label_hint": "インポートしたスキルすべてにこのラベルが付き、ライブラリやエージェントの選択で絞り込めます。",
+      "skills_label_other": "{{count}} 件のスキルを検出",
+      "conflict_badge": "同名あり",
+      "on_conflict_label": "同名のスキルが存在する場合",
+      "on_conflict_skip": "スキップ",
+      "on_conflict_rename": "リネームしてインポート",
+      "on_conflict_overwrite": "既存のスキルを上書き",
+      "on_conflict_fail": "そのスキルを失敗にする",
+      "conflict_hint_other": "選択中のスキルのうち {{count}} 件が既に存在します。",
+      "back": "戻る",
+      "import_other": "{{count}} 件をインポート",
+      "importing_other": "{{count}} 件をインポート中…",
+      "fallback_error": "インポートに失敗しました",
+      "toast_imported_other": "{{count}} 件をインポートしました（{{skipped}} 件スキップ）",
+      "toast_partial": "{{created}} 件成功、{{failed}} 件失敗 — 理由は一覧を確認してください"
     }
   },
   "runtime_import": {

@@ -299,7 +299,28 @@
       "name_conflict_hint": " 가져온 스킬 이름이 이미 있습니다. 다시 시도하기 전에 기존 스킬을 삭제하세요.",
       "fallback_error": "가져오기 실패",
       "cancel": "취소",
-      "toast_imported": "스킬을 가져왔습니다"
+      "toast_imported": "스킬을 가져왔습니다",
+      "github_directory_hint": "스킬 디렉터리를 가리키는 URL은 하위의 모든 스킬을 하나의 그룹 라벨로 일괄 가져옵니다."
+    },
+    "directory": {
+      "source_label": "소스",
+      "label_label": "그룹 라벨",
+      "label_placeholder": "그룹 이름",
+      "label_hint": "가져온 스킬 모두에 이 라벨이 붙어 라이브러리와 에이전트 할당에서 필터링할 수 있습니다.",
+      "skills_label_other": "스킬 {{count}}개 발견",
+      "conflict_badge": "같은 이름 존재",
+      "on_conflict_label": "같은 이름의 스킬이 있을 때",
+      "on_conflict_skip": "건너뛰기",
+      "on_conflict_rename": "이름을 바꿔 가져오기",
+      "on_conflict_overwrite": "기존 스킬 덮어쓰기",
+      "on_conflict_fail": "해당 스킬 실패로 처리",
+      "conflict_hint_other": "선택한 스킬 중 {{count}}개가 이미 존재합니다.",
+      "back": "뒤로",
+      "import_other": "{{count}}개 가져오기",
+      "importing_other": "{{count}}개 가져오는 중…",
+      "fallback_error": "가져오기 실패",
+      "toast_imported_other": "스킬 {{count}}개를 가져왔습니다({{skipped}}개 건너뜀)",
+      "toast_partial": "{{created}}개 성공, {{failed}}개 실패 — 이유는 목록에서 확인하세요"
     }
   },
   "runtime_import": {

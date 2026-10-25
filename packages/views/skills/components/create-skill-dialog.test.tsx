@@ -10,12 +10,19 @@ const TEST_RESOURCES = {
 };
 
 const mockImportSkillArchive = vi.hoisted(() => vi.fn());
+const mockImportSkill = vi.hoisted(() => vi.fn());
+const mockPreviewDirectory = vi.hoisted(() => vi.fn());
+const mockImportDirectory = vi.hoisted(() => vi.fn());
 const mockPrepareFromPicker = vi.hoisted(() => vi.fn());
 const mockWrap = vi.hoisted(() => vi.fn());
 
 vi.mock("@multica/core/api", () => ({
   api: {
     importSkillArchive: (...args: unknown[]) => mockImportSkillArchive(...args),
+    importSkill: (...args: unknown[]) => mockImportSkill(...args),
+    previewSkillDirectoryImport: (...args: unknown[]) =>
+      mockPreviewDirectory(...args),
+    importSkillDirectory: (...args: unknown[]) => mockImportDirectory(...args),
   },
 }));
 
@@ -321,5 +328,110 @@ describe("CreateSkillDialog local import", () => {
     expect(
       screen.queryByText(/a skill with this name already exists/i),
     ).not.toBeInTheDocument();
+  });
+});
+
+const DIRECTORY_PREVIEW = {
+  kind: "directory",
+  owner: "acme",
+  repo: "ui-skills",
+  ref: "main",
+  dir: "skills",
+  label: "ui-skills",
+  skills: [
+    {
+      dir: "skills/alpha",
+      name: "alpha-skill",
+      description: "Alpha preview",
+      conflict: false,
+    },
+    {
+      dir: "skills/beta",
+      name: "beta",
+      description: "",
+      conflict: true,
+    },
+  ],
+};
+
+describe("CreateSkillDialog directory import", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPreviewDirectory.mockResolvedValue(DIRECTORY_PREVIEW);
+    mockImportDirectory.mockResolvedValue({
+      label: { id: "label-1", name: "ui-skills" },
+      results: [
+        { dir: "skills/alpha", name: "alpha-skill", status: "created", reason: "", skill_id: "s1" },
+        { dir: "skills/beta", name: "beta", status: "skipped", reason: "exists", skill_id: "s2" },
+      ],
+    });
+    mockImportSkill.mockResolvedValue({
+      id: "skill-single",
+      workspace_id: "ws-1",
+      name: "single",
+      description: "",
+      content: "#",
+      config: {},
+      files: [],
+      created_by: "user-1",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    });
+  });
+
+  async function openDirectoryPanel() {
+    const helpers = renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: /From URL/i }));
+    fireEvent.change(screen.getByLabelText("Skill URL"), {
+      target: { value: "https://github.com/acme/ui-skills/tree/main/skills" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^Import$/i }));
+    await screen.findByText("alpha-skill");
+    return helpers;
+  }
+
+  it("previews the directory and imports the selected skills with the group label", async () => {
+    const { onClose } = await openDirectoryPanel();
+
+    expect(mockPreviewDirectory).toHaveBeenCalledWith(
+      "https://github.com/acme/ui-skills/tree/main/skills",
+    );
+    const betaRow = screen.getByText("beta").closest("label");
+    expect(betaRow?.textContent).toContain("Name exists");
+
+    // Deselect beta; only alpha rides the batch.
+    if (!betaRow) throw new Error("beta row missing");
+    fireEvent.click(betaRow);
+    fireEvent.click(screen.getByRole("button", { name: /^Import 1 skill$/i }));
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(mockImportDirectory).toHaveBeenCalledWith({
+      url: "https://github.com/acme/ui-skills/tree/main/skills",
+      dirs: ["skills/alpha"],
+      label: "ui-skills",
+      on_conflict: "skip",
+    });
+  });
+
+  it("falls back to the single import when the URL is one skill", async () => {
+    mockPreviewDirectory.mockResolvedValue({ kind: "single" });
+    renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: /From URL/i }));
+    fireEvent.change(screen.getByLabelText("Skill URL"), {
+      target: { value: "https://github.com/acme/ui-skills/tree/main/skills/alpha" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^Import$/i }));
+
+    await waitFor(() => expect(mockImportSkill).toHaveBeenCalled());
+    expect(mockImportDirectory).not.toHaveBeenCalled();
+  });
+
+  it("keeps the panel open with the error when the batch import fails", async () => {
+    const { onClose } = await openDirectoryPanel();
+    mockImportDirectory.mockRejectedValue(new Error("upstream unavailable"));
+
+    fireEvent.click(screen.getByRole("button", { name: /^Import 2 skills$/i }));
+    expect(await screen.findByText(/upstream unavailable/i)).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

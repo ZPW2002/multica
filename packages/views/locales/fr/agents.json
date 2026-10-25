@@ -772,7 +772,11 @@
       "add_dialog_confirm_one": "Ajouter {{count}} skill",
       "add_dialog_confirm_other": "Ajouter {{count}} skills",
       "add_dialog_cancel": "Annuler",
-      "add_failed_toast": "Échec de l'ajout du skill"
+      "add_failed_toast": "Échec de l'ajout du skill",
+      "add_dialog_label_filter": "Filtrer par étiquette",
+      "add_dialog_label_all": "Toutes les étiquettes",
+      "add_dialog_select_group_one": "Tout ajouter ({{count}})",
+      "add_dialog_select_group_other": "Tout ajouter ({{count}})"
     },
     "integrations": {
       "members_note": "Seuls les propriétaires et administrateurs de l'espace de travail peuvent gérer cette connexion. Vous pouvez voir les bots connectés dans Paramètres → Intégrations."
