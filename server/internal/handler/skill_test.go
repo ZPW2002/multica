@@ -1716,6 +1716,7 @@ func newGitHubFixtureClient(t *testing.T, handler http.HandlerFunc) (*http.Clien
 			hosts: map[string]struct{}{
 				"api.github.com":            {},
 				"raw.githubusercontent.com": {},
+				"codeload.github.com":       {},
 			},
 		},
 	}, &requests

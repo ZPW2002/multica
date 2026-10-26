@@ -417,7 +417,7 @@ func (h *Handler) SearchSkills(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := newImportHTTPClient()
 	candidates, err := searchClawHubSkills(httpClient, query)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{
@@ -918,7 +918,7 @@ type githubTreeEntry struct {
 }
 
 // fetchGitHubDefaultBranch returns the default branch of a GitHub repository.
-// Falls back to "main" if the API call fails.
+// Falls back to "HEAD" if the API call fails.
 func fetchGitHubDefaultBranch(ctx context.Context, httpClient *http.Client, owner, repo string) string {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s",
 		url.PathEscape(owner), url.PathEscape(repo))
@@ -927,13 +927,15 @@ func fetchGitHubDefaultBranch(ctx context.Context, httpClient *http.Client, owne
 		if resp != nil {
 			resp.Body.Close()
 		}
-		return "main"
+		// "HEAD" beats guessing a branch name: raw.githubusercontent and
+		// codeload both resolve it to the default branch without an API call.
+		return "HEAD"
 	}
 	defer resp.Body.Close()
 
 	var info githubRepoInfo
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.DefaultBranch == "" {
-		return "main"
+		return "HEAD"
 	}
 	return info.DefaultBranch
 }
@@ -1835,12 +1837,14 @@ var errGitHubAPIBlocked = errors.New("github API blocked (rate limit or auth)")
 // shared self-hosted servers and surfaces to users as 403 errors during
 // skill imports. Setting GITHUB_TOKEN raises the limit to 5000/hour.
 func doGitHubAPIGet(ctx context.Context, httpClient *http.Client, apiURL string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	addGitHubAuthHeader(req)
-	return httpClient.Do(req)
+	return doImportGet(ctx, httpClient, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		addGitHubAuthHeader(req)
+		return req, nil
+	})
 }
 
 func addGitHubAuthHeader(req *http.Request) {
@@ -2090,7 +2094,7 @@ func fetchFromGitHub(ctx context.Context, httpClient *http.Client, rawURL string
 	// back to the per-directory contents crawl when the tree is unavailable or
 	// truncated (kept lenient so a rate-limited listing doesn't fail an import
 	// that already produced a valid SKILL.md).
-	tree, truncated, treeErr := fetchGitHubTree(ctx, httpClient, spec.owner, spec.repo, spec.ref)
+	tree, truncated, treeErr := fetchGitHubTreeResilient(ctx, httpClient, spec.owner, spec.repo, spec.ref)
 	if treeErr == nil && !truncated {
 		if err := addSupportingFilesFromTree(ctx, httpClient, result, tree, rawPrefix, spec.skillDir); err != nil {
 			return nil, err
@@ -2111,15 +2115,73 @@ func fetchFromGitHub(ctx context.Context, httpClient *http.Client, rawURL string
 // header would leak the token to those third-party hosts.
 const rawGitHubContentHost = "raw.githubusercontent.com"
 
+// GitHub egress from self-hosted networks is intermittently black-holed:
+// connections establish but the response header never arrives, hanging until
+// the client timeout. Two defenses keep an import inside its fetch budget:
+// ResponseHeaderTimeout bounds each attempt well below the client timeout,
+// and doImportGet retries transport failures and 5xx on a fresh attempt —
+// the next connection usually succeeds immediately.
+const (
+	importFetchAttempts        = 3
+	importFetchRetryBackoff    = 600 * time.Millisecond
+	importFetchRetryBackoffMax = 2 * time.Second
+	importResponseHeaderWait   = 8 * time.Second
+)
+
+// newImportHTTPClient builds the HTTP client every import path uses (single,
+// directory, refresh). The bounded transport is the point: without
+// ResponseHeaderTimeout one black-holed connection eats the whole client
+// budget, and with HTTP/2's single connection per host it blocks every
+// queued request behind it.
+func newImportHTTPClient() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = importResponseHeaderWait
+	return &http.Client{Transport: t, Timeout: 30 * time.Second}
+}
+
+// doImportGet runs a GET with bounded retries. Requests are rebuilt per
+// attempt via buildReq so headers and context stay per-attempt fresh; only
+// transport errors and 5xx retry (422/403/404 are authoritative answers).
+func doImportGet(ctx context.Context, client *http.Client, buildReq func() (*http.Request, error)) (*http.Response, error) {
+	backoff := importFetchRetryBackoff
+	var lastErr error
+	for attempt := 0; attempt < importFetchAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			backoff *= 2
+			if backoff > importFetchRetryBackoffMax {
+				backoff = importFetchRetryBackoffMax
+			}
+		}
+		req, err := buildReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode < http.StatusInternalServerError {
+			return resp, nil
+		}
+		if err == nil {
+			lastErr = fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
+			resp.Body.Close()
+			continue
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 // fetchRawFile downloads a URL and returns the body bytes. Returns an error
 // if the response exceeds maxImportFileSize so we never silently truncate a
 // half-downloaded skill file into the workspace.
 func fetchRawFile(ctx context.Context, httpClient *http.Client, fileURL string) ([]byte, error) {
-	req, err := newRawFileRequest(ctx, fileURL)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := httpClient.Do(req)
+	resp, err := doImportGet(ctx, httpClient, func() (*http.Request, error) {
+		return newRawFileRequest(ctx, fileURL)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2358,7 +2420,7 @@ func (h *Handler) ImportSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := newImportHTTPClient()
 
 	// Bound the whole server-side fetch under an overall deadline that is
 	// shorter than the reverse-proxy / CDN gateway timeout in front of the API.

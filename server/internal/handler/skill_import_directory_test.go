@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -427,5 +430,179 @@ func TestPreviewSkillDirectoryBareRepoURL(t *testing.T) {
 	}
 	if len(body.Skills) != 2 || body.Skills[0].Dir != "skills/alpha" || body.Skills[1].Dir != "skills/beta" {
 		t.Fatalf("skills = %#v", body.Skills)
+	}
+}
+
+func TestDoImportGetRetries5xxThenSucceeds(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := newImportHTTPClient()
+	resp, err := doImportGet(t.Context(), client, func() (*http.Request, error) {
+		return http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doImportGet: %v", err)
+	}
+	resp.Body.Close()
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (one 502 retry)", calls)
+	}
+}
+
+func TestDoImportGetGivesUpAfterAttempts(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := newImportHTTPClient()
+	if _, err := doImportGet(t.Context(), client, func() (*http.Request, error) {
+		return http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	}); err == nil {
+		t.Fatal("expected error after exhausting attempts")
+	}
+	if calls != importFetchAttempts {
+		t.Fatalf("calls = %d, want %d", calls, importFetchAttempts)
+	}
+}
+
+func TestDoImportGetDoesNotRetry4xx(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := newImportHTTPClient()
+	resp, err := doImportGet(t.Context(), client, func() (*http.Request, error) {
+		return http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doImportGet: %v", err)
+	}
+	resp.Body.Close()
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (422 is authoritative)", calls)
+	}
+}
+
+// tarballFixtureBytes builds a codeload-style tar.gz whose entries live under
+// a "repo-sha/" top-level directory, exactly as codeload serves them.
+func tarballFixtureBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	files := []struct{ name, body string }{
+		{"ui-skills-abc/README.md", "# repo"},
+		{"ui-skills-abc/skills/alpha/SKILL.md", "---\nname: alpha-skill\n---\nbody"},
+		{"ui-skills-abc/skills/alpha/references/notes.md", "notes"},
+		{"ui-skills-abc/skills/beta/SKILL.md", "beta"},
+	}
+	for _, f := range files {
+		if err := tw.WriteHeader(&tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("tar header: %v", err)
+		}
+		if _, err := tw.Write([]byte(f.body)); err != nil {
+			t.Fatalf("tar body: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestGithubTreeViaTarballStripsTopDir(t *testing.T) {
+	client, requests := newGitHubFixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Original-Host") == "codeload.github.com" {
+			w.Write(tarballFixtureBytes(t))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	entries, err := githubTreeViaTarball(t.Context(), client, "acme", "ui-skills", "")
+	if err != nil {
+		t.Fatalf("githubTreeViaTarball: %v", err)
+	}
+	got := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Type != "blob" || e.Size <= 0 {
+			t.Fatalf("entry = %#v", e)
+		}
+		got = append(got, e.Path)
+	}
+	want := "README.md,skills/alpha/SKILL.md,skills/alpha/references/notes.md,skills/beta/SKILL.md"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("entries = %v", got)
+	}
+	for _, req := range *requests {
+		if strings.Contains(req, "codeload.github.com") && !strings.Contains(req, "/tar.gz/HEAD") {
+			t.Fatalf("empty ref must request /tar.gz/HEAD, got %s", req)
+		}
+	}
+}
+
+func TestFetchGitHubTreeResilientFallsBackOnAPIRateLimit(t *testing.T) {
+	client, _ := newGitHubFixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("X-Test-Original-Host") {
+		case "api.github.com":
+			// Shared-IP anonymous quota exhaustion.
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"message":"API rate limit exceeded"}`))
+		case "codeload.github.com":
+			w.Write(tarballFixtureBytes(t))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	tree, truncated, err := fetchGitHubTreeResilient(t.Context(), client, "acme", "ui-skills", "main")
+	if err != nil {
+		t.Fatalf("fetchGitHubTreeResilient: %v", err)
+	}
+	if truncated || len(tree) != 4 {
+		t.Fatalf("tree = %#v truncated=%v", tree, truncated)
+	}
+}
+
+func TestResolveGitHubDirectorySpecSurvivesAPIBlock(t *testing.T) {
+	// The screenshot scenario end-to-end at the resolver level: bare repo
+	// URL, API fully rate-limited, codeload tarball carries the tree.
+	client, _ := newGitHubFixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Original-Host") == "api.github.com" {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"message":"API rate limit exceeded"}`))
+			return
+		}
+		if r.Header.Get("X-Test-Original-Host") == "codeload.github.com" {
+			w.Write(tarballFixtureBytes(t))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	spec, rawPrefix, tree, err := resolveGitHubDirectorySpec(t.Context(), client, "https://github.com/acme/ui-skills")
+	if err != nil {
+		t.Fatalf("resolveGitHubDirectorySpec: %v", err)
+	}
+	if spec.ref != "HEAD" || !strings.Contains(rawPrefix, "/HEAD/") {
+		t.Fatalf("ref = %q rawPrefix = %q", spec.ref, rawPrefix)
+	}
+	if got := childSkillDirs(tree, ""); len(got) != 2 || got[0] != "skills/alpha" || got[1] != "skills/beta" {
+		t.Fatalf("childSkillDirs = %v", got)
 	}
 }

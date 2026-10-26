@@ -113,7 +113,7 @@ func resolveGitHubDirectorySpec(ctx context.Context, httpClient *http.Client, ra
 	if spec.ref == "" {
 		spec.ref = fetchGitHubDefaultBranch(ctx, httpClient, spec.owner, spec.repo)
 	}
-	tree, truncated, err := fetchGitHubTree(ctx, httpClient, spec.owner, spec.repo, spec.ref)
+	tree, truncated, err := fetchGitHubTreeResilient(ctx, httpClient, spec.owner, spec.repo, spec.ref)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -297,9 +297,7 @@ func suggestedDirectoryLabel(repo string) string {
 // importDirectoryHTTPClient builds the HTTP client the directory handlers use
 // for upstream fetches. Swappable in tests to redirect GitHub traffic to a
 // fixture server — the same seam pattern as clawHubAPIBase.
-var importDirectoryHTTPClient = func() *http.Client {
-	return &http.Client{Timeout: 30 * time.Second}
-}
+var importDirectoryHTTPClient = newImportHTTPClient
 
 // ImportSkillDirectory imports the selected child skills of a directory URL
 // and attaches them to one shared skill label (found or created by name).
