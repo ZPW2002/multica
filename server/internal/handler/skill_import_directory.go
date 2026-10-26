@@ -129,10 +129,12 @@ func rawGitHubPrefix(owner, repo, ref string) string {
 		url.PathEscape(owner), url.PathEscape(repo), escapeRefPath(ref))
 }
 
-// childSkillDirs lists the direct children of parentDir that contain a
-// SKILL.md, sorted by path for stable preview output. Skills nested deeper
-// than one level are intentionally not offered: the multi-skill convention is
-// one directory per skill.
+// childSkillDirs lists every directory under parentDir that contains a
+// SKILL.md, sorted by path for stable preview output. Enumeration is
+// depth-unbounded so the natural URLs work: a bare repository root (skills
+// usually nested under skills/) as well as a pointed subdirectory. A skill
+// directory that itself contains a deeper SKILL.md (e.g. bundled examples)
+// shows up twice — the preview list lets the user drop the nested one.
 func childSkillDirs(tree []githubTreeEntry, parentDir string) []string {
 	prefix := ""
 	if parentDir != "" {
@@ -151,8 +153,8 @@ func childSkillDirs(tree []githubTreeEntry, parentDir string) []string {
 			continue
 		}
 		dir := strings.TrimSuffix(rest, "/SKILL.md")
-		if dir == "" || strings.Contains(dir, "/") {
-			continue // root file or deeper than a direct child
+		if dir == "" {
+			continue
 		}
 		if parentDir == "" {
 			dirs = append(dirs, dir)

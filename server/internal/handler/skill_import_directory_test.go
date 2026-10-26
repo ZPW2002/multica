@@ -133,15 +133,16 @@ func TestChildSkillDirs(t *testing.T) {
 		{Path: "toplevel/SKILL.md", Type: "blob"},
 	}
 	got := childSkillDirs(tree, "skills")
-	want := []string{"skills/alpha", "skills/beta"}
+	want := []string{"skills/alpha", "skills/beta", "skills/nested/inner"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("childSkillDirs = %v, want %v", got, want)
 	}
-	// Root enumeration only offers skills sitting directly at the repository
-	// root; deeper ones belong to the directory that holds them.
+	// Root enumeration is depth-unbounded so a bare repository URL finds
+	// skills nested under skills/ too.
 	root := childSkillDirs(tree, "")
-	if strings.Join(root, ",") != "toplevel" {
-		t.Fatalf("childSkillDirs(root) = %v, want [toplevel]", root)
+	wantRoot := []string{"other/gamma", "skills/alpha", "skills/beta", "skills/nested/inner", "toplevel"}
+	if strings.Join(root, ",") != strings.Join(wantRoot, ",") {
+		t.Fatalf("childSkillDirs(root) = %v, want %v", root, wantRoot)
 	}
 }
 
@@ -374,5 +375,57 @@ func TestImportSkillDirectoryRejectsSingleSkillURL(t *testing.T) {
 	testHandler.ImportSkillDirectory(w, req)
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// rootlessFixture serves the same repo without a root SKILL.md — the bare
+// repository URL (no /tree/{ref} segment) is then a pure directory import.
+func rootlessFixture(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	base := directoryFixture(t)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Original-Host") == "api.github.com" &&
+			r.URL.Path == "/repos/acme/ui-skills/git/trees/main" {
+			writeJSON(w, http.StatusOK, githubTreeResponse{
+				Tree: []githubTreeEntry{
+					{Path: "README.md", Type: "blob"},
+					{Path: "skills/alpha/SKILL.md", Type: "blob"},
+					{Path: "skills/beta/SKILL.md", Type: "blob"},
+				},
+			})
+			return
+		}
+		base(w, r)
+	}
+}
+
+func TestPreviewSkillDirectoryBareRepoURL(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	prev := importDirectoryHTTPClient
+	client, _ := newGitHubFixtureClient(t, rootlessFixture(t))
+	importDirectoryHTTPClient = func() *http.Client { return client }
+	t.Cleanup(func() { importDirectoryHTTPClient = prev })
+
+	// No /tree/{ref} segment: the repository root itself is the directory.
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/preview", map[string]any{
+		"url": "https://github.com/acme/ui-skills",
+	})
+	testHandler.PreviewSkillDirectoryImport(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body SkillDirectoryPreviewResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Kind != "directory" || body.Dir != "" || body.Ref != "main" {
+		t.Fatalf("head = %#v", body)
+	}
+	if len(body.Skills) != 2 || body.Skills[0].Dir != "skills/alpha" || body.Skills[1].Dir != "skills/beta" {
+		t.Fatalf("skills = %#v", body.Skills)
 	}
 }

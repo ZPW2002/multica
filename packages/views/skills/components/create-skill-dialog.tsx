@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { api } from "@multica/core/api";
+import { ApiError, api } from "@multica/core/api";
 import type { Skill, SkillDirectoryPreview } from "@multica/core/types";
 import {
   prepareSkillArchiveFromPickerFiles,
@@ -548,9 +548,17 @@ function UrlForm({
             setLoading(false);
             return;
           }
-        } catch {
-          // Fall through to the single import below; it reports the real
-          // upstream error for URLs the preview cannot make sense of.
+        } catch (err) {
+          // A 4xx from the preview is a definitive answer about this URL
+          // (e.g. "no skill directories found") — show it instead of the
+          // single import's vaguer "SKILL.md not found". Transient upstream
+          // failures (5xx) still fall through to the single import, which
+          // retries the fetches on its own budget.
+          if (err instanceof ApiError && err.status < 500) {
+            setError(err.message);
+            setLoading(false);
+            return;
+          }
         }
       }
       const skill = await api.importSkill({ url: trimmed });
