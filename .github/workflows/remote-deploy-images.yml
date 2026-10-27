@@ -1,0 +1,44 @@
+name: Remote deploy images
+
+# One-off helper for deploying to a low-spec remote host: builds the
+# self-host backend and web images natively on the amd64 runner (no QEMU on
+# the local arm64 machine, no build on the remote) and uploads them as a
+# single gzipped docker-save artifact for `gh run download`.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: |
+          VERSION="v0.7.0-local-$(date +%Y%m%d)"
+          docker build \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "COMMIT=${GITHUB_SHA::12}" \
+            --build-arg "DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -f Dockerfile -t multica-backend:deploy .
+
+      - name: Build web image
+        run: docker build -f Dockerfile.web -t multica-web:deploy .
+
+      - name: Save images
+        run: |
+          docker save multica-backend:deploy multica-web:deploy \
+            | gzip -1 > multica-images.tar.gz
+          ls -lh multica-images.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multica-images
+          path: multica-images.tar.gz
+          retention-days: 7
+          compression-level: 0
