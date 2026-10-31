@@ -61,6 +61,18 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         : isStaging
           ? (process.env.EXPO_BUNDLE_IDENTIFIER_STAGING ?? "ai.multica.mobile.staging")
           : (process.env.EXPO_BUNDLE_IDENTIFIER_DEV ?? "ai.multica.mobile.dev"),
+      // Self-hosted builds may point EXPO_PUBLIC_API_URL at a bare-IP
+      // cleartext endpoint (http://<ip>:<port>). ATS blocks cleartext
+      // outright and NSExceptionDomains cannot express a bare IP, so the
+      // only opt-in is NSAllowsArbitraryLoads — gated behind this env flag
+      // so store-bound variants keep full ATS enforcement.
+      ...(process.env.EXPO_IOS_ALLOW_CLEARTEXT === "1"
+        ? {
+            infoPlist: {
+              NSAppTransportSecurity: { NSAllowsArbitraryLoads: true },
+            },
+          }
+        : {}),
     },
     plugins: [
       "expo-router",
