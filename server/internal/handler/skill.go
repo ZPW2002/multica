@@ -2103,9 +2103,15 @@ const (
 // budget, and with HTTP/2's single connection per host it blocks every
 // queued request behind it.
 func newImportHTTPClient() *http.Client {
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.ResponseHeaderTimeout = importResponseHeaderWait
-	return &http.Client{Transport: t, Timeout: 30 * time.Second}
+	// DefaultTransport is *http.Transport in production, but tests swap it
+	// wholesale for fixture transports; those are honored as-is — there is
+	// nothing to tune on an unknown RoundTripper.
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		t = t.Clone()
+		t.ResponseHeaderTimeout = importResponseHeaderWait
+		return &http.Client{Transport: t, Timeout: 30 * time.Second}
+	}
+	return &http.Client{Transport: http.DefaultTransport, Timeout: 30 * time.Second}
 }
 
 // doImportGet runs a GET with bounded retries. Requests are rebuilt per
