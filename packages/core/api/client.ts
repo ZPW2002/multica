@@ -387,6 +387,8 @@ import {
   RedeemWecomBindingTokenResponseSchema,
   EMPTY_WECOM_INSTALLATION,
   EMPTY_LIST_WECOM_INSTALLATIONS_RESPONSE,
+  ListLarkInstallationsResponseSchema,
+  EMPTY_LIST_LARK_INSTALLATIONS_RESPONSE,
   EMPTY_REDEEM_WECOM_BINDING_TOKEN_RESPONSE,
   TelegramInstallationSchema,
   ListTelegramInstallationsResponseSchema,
@@ -4220,10 +4222,8 @@ export class ApiClient {
     await this.fetch(`/api/labels/${id}`, { method: "DELETE" });
   }
 
-  // Workspace workflows (MUL-7420). Reads are open to any workspace member;
-  // creating, editing and deleting a workflow is owner/admin only. Adoption
-  // (creating a workflow, pointing a project at one) is gated server-side by
-  // the project_workflows_v1 flag and returns 403 when it is off.
+  // Workspace workflows (MUL-7420). Any workspace member may read and create
+  // workflows; only the workflow owner and workspace admins may edit or delete.
   async listIssueWorkflows(): Promise<ListIssueWorkflowsResponse> {
     const raw = await this.fetch<unknown>(`/api/issue-workflows`);
     return parseWithFallback(raw, ListIssueWorkflowsResponseSchema, EMPTY_LIST_ISSUE_WORKFLOWS_RESPONSE, {
@@ -5131,7 +5131,13 @@ export class ApiClient {
 
   // Lark integration
   async listLarkInstallations(workspaceId: string): Promise<ListLarkInstallationsResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/lark/installations`);
+    const endpoint = `/api/workspaces/${workspaceId}/lark/installations`;
+    return parseWithFallback(
+      await this.fetch(endpoint),
+      ListLarkInstallationsResponseSchema,
+      EMPTY_LIST_LARK_INSTALLATIONS_RESPONSE,
+      { endpoint },
+    );
   }
 
   async beginLarkInstall(
