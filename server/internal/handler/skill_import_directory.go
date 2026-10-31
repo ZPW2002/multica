@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -371,11 +372,27 @@ func (h *Handler) ImportSkillDirectory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	results := make([]SkillDirectoryImportItem, 0, len(dirs))
-	for _, dir := range dirs {
-		item := h.importSkillDirectoryItem(ctx, r, httpClient, spec, rawPrefix, tree, dir, normalized, strategy, workspaceID, workspaceUUID, creatorUUID, creatorID)
-		results = append(results, item)
+	// Sibling skills are independent, and fetching dominates the wall time —
+	// each item pulls its SKILL.md plus supporting files. Run a few at a time
+	// so a batch that used to take minutes on slow GitHub egress (the case a
+	// reverse proxy answers with 504 before the handler finishes) fits inside
+	// a typical idle timeout. Each item owns its DB writes; the shared tree
+	// and spec are read-only, and results keep enumeration order via indices.
+	// The group label attaches once every worker has returned.
+	results := make([]SkillDirectoryImportItem, len(dirs))
+	const directoryImportWorkers = 4
+	sem := make(chan struct{}, directoryImportWorkers)
+	var wg sync.WaitGroup
+	for i, dir := range dirs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = h.importSkillDirectoryItem(ctx, r, httpClient, spec, rawPrefix, tree, dir, normalized, strategy, workspaceID, workspaceUUID, creatorUUID, creatorID)
+		}()
 	}
+	wg.Wait()
 
 	if labelName != "" {
 		// A failed label attach must not fail the response: the skills are

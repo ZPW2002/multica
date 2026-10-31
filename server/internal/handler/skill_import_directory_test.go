@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -319,6 +321,66 @@ func TestImportSkillDirectoryCreatesSkillsAndGroupLabel(t *testing.T) {
 	}
 	if len(labels) != 1 || labels[0].Name != "ui-skills" {
 		t.Fatalf("labels = %#v", labels)
+	}
+}
+
+// TestImportSkillDirectoryImportsConcurrently pins the parallel batch: each
+// item's first fetch is its SKILL.md, so the fixture counts how many of those
+// overlap. A regression to a serial loop answers one request at a time and
+// maxInFlight stays at 1, failing fast instead of hanging.
+func TestImportSkillDirectoryImportsConcurrently(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("handler test DB not configured")
+	}
+	cleanupDirectoryImport(t, "ui-skills", "alpha-skill", "beta")
+
+	var inFlight, maxInFlight atomic.Int64
+	prev := importDirectoryHTTPClient
+	client, _ := newGitHubFixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Original-Host") == "raw.githubusercontent.com" && strings.HasSuffix(r.URL.Path, "/SKILL.md") {
+			n := inFlight.Add(1)
+			for {
+				max := maxInFlight.Load()
+				if n <= max || maxInFlight.CompareAndSwap(max, n) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond) // widen the overlap window
+			defer inFlight.Add(-1)
+		}
+		directoryFixture(t)(w, r)
+	})
+	importDirectoryHTTPClient = func() *http.Client { return client }
+	t.Cleanup(func() { importDirectoryHTTPClient = prev })
+
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(testUserID, http.MethodPost, "/api/skills/import/batch", map[string]any{
+		"url":         "https://github.com/acme/ui-skills/tree/main/skills",
+		"on_conflict": "skip",
+	})
+	testHandler.ImportSkillDirectory(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+
+	var body SkillDirectoryImportResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Results) != 2 {
+		t.Fatalf("results = %#v", body.Results)
+	}
+	for _, item := range body.Results {
+		if item.Status != "created" {
+			t.Fatalf("item = %#v", item)
+		}
+	}
+	// Results keep enumeration order even though the imports overlap.
+	if body.Results[0].Dir != "skills/alpha" || body.Results[1].Dir != "skills/beta" {
+		t.Fatalf("result order = %s, %s", body.Results[0].Dir, body.Results[1].Dir)
+	}
+	if maxInFlight.Load() < 2 {
+		t.Fatalf("SKILL.md fetches never overlapped: maxInFlight = %d (serial import?)", maxInFlight.Load())
 	}
 }
 
