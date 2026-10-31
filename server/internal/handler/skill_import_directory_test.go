@@ -599,7 +599,7 @@ func TestResolveGitHubDirectorySpecSurvivesAPIBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveGitHubDirectorySpec: %v", err)
 	}
-	if spec.ref != "HEAD" || !strings.Contains(rawPrefix, "/HEAD/") {
+	if spec.ref != "HEAD" || !strings.HasSuffix(rawPrefix, "/HEAD") {
 		t.Fatalf("ref = %q rawPrefix = %q", spec.ref, rawPrefix)
 	}
 	if got := childSkillDirs(tree, ""); len(got) != 2 || got[0] != "skills/alpha" || got[1] != "skills/beta" {

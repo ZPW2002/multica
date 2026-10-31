@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +19,7 @@ func TestRefreshSkill_GitHubBundleIsAtomic(t *testing.T) {
 		name         string
 		treeStatus   int
 		crawl        bool
+		tarballStatus int
 		listingError string
 		fileStatus   int
 		shortBody    bool
@@ -26,8 +30,14 @@ func TestRefreshSkill_GitHubBundleIsAtomic(t *testing.T) {
 		{name: "complete crawl", crawl: true, want: 200},
 		{name: "tree skips submodule", submodule: true, want: 200},
 		{name: "crawl skips submodule", crawl: true, submodule: true, want: 200},
-		{name: "tree unavailable complete crawl", treeStatus: 403, crawl: true, want: 200},
-		{name: "tree and crawl unavailable", treeStatus: 403, listingError: "root status", want: 503},
+		// The codeload tarball sits between the tree API and the contents
+		// crawl: when the tree API errors, refresh tries it before crawling.
+		// "complete crawl" fails the tarball too so the crawl path stays
+		// exercised; the next case proves the tarball alone can finish the
+		// bundle, and the last one keeps the all-enumeration-fails atomicity.
+		{name: "tree unavailable complete crawl", treeStatus: 403, crawl: true, tarballStatus: 503, want: 200},
+		{name: "tree unavailable tarball completes", treeStatus: 403, tarballStatus: 200, want: 200},
+		{name: "tree and crawl unavailable", treeStatus: 403, tarballStatus: 503, listingError: "root status", want: 503},
 		{name: "root listing unavailable", crawl: true, listingError: "root status", want: 503},
 		{name: "root listing malformed", crawl: true, listingError: "root json", want: 503},
 		{name: "root listing null", crawl: true, listingError: "root null", want: 503},
@@ -82,6 +92,40 @@ func TestRefreshSkill_GitHubBundleIsAtomic(t *testing.T) {
 						tree = append(tree, githubTreeEntry{Path: "skills/foo/vendor", Type: "commit"})
 					}
 					writeJSON(w, 200, githubTreeResponse{Truncated: tc.crawl, Tree: tree})
+				case strings.Contains(r.URL.Path, "/tar.gz/"):
+					if tc.tarballStatus == 0 {
+						t.Errorf("unexpected upstream request: %s", r.URL.Path)
+						http.NotFound(w, r)
+						return
+					}
+					if tc.tarballStatus != http.StatusOK {
+						w.WriteHeader(tc.tarballStatus)
+						return
+					}
+					var tarball bytes.Buffer
+					gz := gzip.NewWriter(&tarball)
+					tw := tar.NewWriter(gz)
+					files := []struct{ name, body string }{
+						{"skills-abc/skills/foo/SKILL.md", "---\nname: foo\ndescription: refreshed\n---\n# Refreshed"},
+						{"skills-abc/skills/foo/refs/guide.md", "fresh guide"},
+						{"skills-abc/skills/foo/image.png", ""},
+					}
+					for _, f := range files {
+						if err := tw.WriteHeader(&tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.body)), Typeflag: tar.TypeReg}); err != nil {
+							t.Fatalf("tar header: %v", err)
+						}
+						if _, err := tw.Write([]byte(f.body)); err != nil {
+							t.Fatalf("tar body: %v", err)
+						}
+					}
+					if err := tw.Close(); err != nil {
+						t.Fatalf("tar close: %v", err)
+					}
+					if err := gz.Close(); err != nil {
+						t.Fatalf("gzip close: %v", err)
+					}
+					w.Header().Set("Content-Type", "application/x-gzip")
+					w.Write(tarball.Bytes())
 				case strings.HasSuffix(r.URL.Path, "/contents/skills/foo"):
 					switch tc.listingError {
 					case "root status":
