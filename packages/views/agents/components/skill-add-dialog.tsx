@@ -3,8 +3,8 @@
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ListFilter } from "lucide-react";
 import type { Agent, SkillSummary } from "@multica/core/types";
+import { Filter } from "@multica/ui/icons";
 import { api } from "@multica/core/api";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { labelListOptions } from "@multica/core/labels/queries";
@@ -146,7 +146,7 @@ export function SkillAddDialog({
               ]}
             >
               <SelectTrigger className="min-w-0 flex-1" aria-label={t(($) => $.tab_body.skills.add_dialog_label_filter)}>
-                <ListFilter className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <Filter className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
