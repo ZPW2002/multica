@@ -191,7 +191,9 @@ export const BoardColumn = memo(function BoardColumn({
         issue={issue}
         childProgress={childProgressMap?.get(issue.id)}
         project={
-          issue.project_id ? projectMap?.get(issue.project_id) : undefined
+          issue.project_id && issue.project_id !== projectId
+            ? projectMap?.get(issue.project_id)
+            : undefined
         }
         disableSorting={!!sortLabel}
       />
@@ -236,7 +238,7 @@ export const BoardColumn = memo(function BoardColumn({
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  className="rounded-full text-muted-foreground"
+                  className="text-muted-foreground"
                   aria-label={tCommon(($) => $.more_actions)}
                 >
                   <MoreHorizontal className="size-3.5" />
@@ -253,7 +255,7 @@ export const BoardColumn = memo(function BoardColumn({
                           <Button
                             variant="ghost"
                             size="icon-sm"
-                            className="rounded-full text-muted-foreground"
+                            className="text-muted-foreground"
                             aria-label={tCommon(($) => $.more_actions)}
                           >
                             <MoreHorizontal className="size-3.5" />
@@ -283,7 +285,7 @@ export const BoardColumn = memo(function BoardColumn({
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  className="rounded-full text-muted-foreground"
+                  className="text-muted-foreground"
                   aria-label={t(($) => $.board.add_issue_tooltip)}
                   onClick={() => {
                     const data = {

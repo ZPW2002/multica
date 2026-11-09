@@ -152,6 +152,8 @@ backend:
     # create workspaces. Empty = every signed-in user may create one.
     # disableWorkspaceCreation=true still blocks everyone.
     workspaceCreationAllowedEmails: ""
+    # Set to true to stop the app from asking users to star Multica on GitHub.
+    disableStarPrompt: false
     # Set to "1" or "true" to disable first-party anonymous self-host
     # telemetry collection and delivery.
     doNotTrack: ""
@@ -170,6 +172,9 @@ backend:
     s3Region: us-west-2
     cloudfrontDomain: ""
     cloudfrontKeyPairId: ""
+    # Text/HTML preview size only; values above 16 MiB are clamped.
+    # Larger limits can slow browser previews.
+    maxPreviewSize: 2MiB
     localUploadBaseUrl: http://api.multica.dev.lan
   resources:
     requests:

@@ -53,7 +53,12 @@ export const chatSessionsOptions = (wsId: string | null) =>
     queryKey: chatKeys.sessions(wsId),
     queryFn: ({ signal }) => api.listChatSessions({ signal }),
     enabled: !!wsId,
-    staleTime: Infinity,
+    // Inherits the 60s default instead of Infinity on purpose: realtime
+    // invalidation rides a socket that iOS suspends in the background, and
+    // the reconnect-time refetch does not fire on every foreground resume —
+    // sessions created on another device would then stay invisible until a
+    // full app restart. A bounded staleTime makes any sheet open or
+    // foreground return older than a minute self-heal over plain HTTP.
   });
 
 export const chatMessagesOptions = (sessionId: string | null) =>
@@ -61,7 +66,9 @@ export const chatMessagesOptions = (sessionId: string | null) =>
     queryKey: chatKeys.messages(sessionId ?? ""),
     queryFn: ({ signal }) => api.listChatMessages(sessionId!, { signal }),
     enabled: !!sessionId,
-    staleTime: Infinity,
+    // Same reasoning as chatSessionsOptions: per-session realtime covers
+    // live updates, but a resume gap must not freeze the transcript past a
+    // minute — reopening the chat refetches over HTTP.
   });
 
 export const pendingChatTaskOptions = (sessionId: string | null) =>

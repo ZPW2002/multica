@@ -17,14 +17,16 @@ import type {
   ListGroupedIssuesParams,
   ListIssuesParams,
   ListIssuesCache,
+  ListIssuesResponse,
 } from "../types";
+import type { SidebarIssuesRequest } from "./sidebar-list";
 import { ALL_STATUSES } from "./config";
 import { issueColumnCategory } from "./status-category";
 
-export function issueTasksOptions(issueId: string) {
+export function issueTasksOptions(issueId: string, includeDescendants = false) {
   return queryOptions({
-    queryKey: issueKeys.tasks(issueId),
-    queryFn: () => api.listTasksByIssue(issueId),
+    queryKey: includeDescendants ? issueKeys.subtreeTasks(issueId) : issueKeys.tasks(issueId),
+    queryFn: () => api.listTasksByIssue(issueId, includeDescendants),
     enabled: !!issueId,
     staleTime: 30_000,
     refetchOnWindowFocus: true,
@@ -126,6 +128,14 @@ export const issueKeys = {
       projectId,
       assigneeTypes ?? null,
     ] as const,
+  /** Every sidebar issue list — prefix for cross-list refresh. */
+  sidebarAll: (wsId: string) => [...issueKeys.all(wsId), "sidebar"] as const,
+  /**
+   * One expanded sidebar row's issues. `source` (`project:{id}` / `view:{id}` / `builtin:{key}`)
+   * sits at a fixed index so realtime refresh can target a project's lists.
+   */
+  sidebar: (wsId: string, source: string, request: SidebarIssuesRequest, limit: number) =>
+    [...issueKeys.sidebarAll(wsId), source, request, limit] as const,
   detail: (wsId: string, id: string) =>
     [...issueKeys.all(wsId), "detail", id] as const,
   /** Resolve a bare issue identifier (e.g. "MUL-123") to an issue. */
@@ -193,6 +203,7 @@ export const issueKeys = {
   tasksAll: () => ["issues", "tasks"] as const,
   /** Per-issue task list (issue-detail Execution log section). */
   tasks: (issueId: string) => [...issueKeys.tasksAll(), issueId] as const,
+  subtreeTasks: (issueId: string) => [...issueKeys.tasks(issueId), "subtree"] as const,
   sourceContextPreview: (wsId: string, anchorCommentId: string) =>
     ["source-context", "preview", wsId, anchorCommentId] as const,
 };
@@ -445,6 +456,61 @@ export function projectGanttIssuesOptions(
   return queryOptions({
     queryKey: issueKeys.projectGantt(wsId, projectId, assigneeTypes),
     queryFn: () => fetchProjectGanttIssues(projectId, assigneeTypes),
+  });
+}
+
+/** Both list endpoints cap a page here, so a longer sidebar list is fetched in pages. */
+const SIDEBAR_MAX_PAGE = 100;
+
+async function listSidebarTableIssues(query: IssueTableQuerySpec, limit: number): Promise<ListIssuesResponse> {
+  const issues: Issue[] = [];
+  let total = 0;
+  let cursor: string | null = null;
+  do {
+    const page = await api.listIssueTableRows({
+      query,
+      group: { kind: "none" },
+      group_key: null,
+      hierarchy: { enabled: false },
+      parent_id: null,
+      page: { limit: Math.min(limit - issues.length, SIDEBAR_MAX_PAGE), cursor },
+    });
+    issues.push(...page.rows.map((row) => row.issue));
+    total = page.total;
+    cursor = page.next_cursor;
+  } while (cursor && issues.length < limit);
+  return { issues, total };
+}
+
+async function listSidebarIssues(params: ListIssuesParams, limit: number): Promise<ListIssuesResponse> {
+  const issues: Issue[] = [];
+  let total = 0;
+  do {
+    const page = await api.listIssues({
+      ...params,
+      limit: Math.min(limit - issues.length, SIDEBAR_MAX_PAGE),
+      offset: issues.length,
+    });
+    issues.push(...page.issues);
+    total = page.total;
+    if (page.issues.length === 0) break;
+  } while (issues.length < limit && issues.length < total);
+  return { issues, total };
+}
+
+/** The first `limit` issues of a sidebar list, with the filtered total. */
+export function sidebarIssuesOptions(
+  wsId: string,
+  source: string,
+  request: SidebarIssuesRequest,
+  limit: number,
+) {
+  return queryOptions({
+    queryKey: issueKeys.sidebar(wsId, source, request, limit),
+    queryFn: () =>
+      "table" in request
+        ? listSidebarTableIssues(request.table, limit)
+        : listSidebarIssues(request, limit),
   });
 }
 
