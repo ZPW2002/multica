@@ -3,6 +3,10 @@ FROM golang:1.27.3-alpine AS builder
 
 RUN apk add --no-cache git
 
+# Optional module-proxy override for restricted networks (unset = Go default).
+ARG GOPROXY=
+ENV GOPROXY=${GOPROXY}
+
 WORKDIR /src
 
 # Cache dependencies
